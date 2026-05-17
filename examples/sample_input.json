@@ -1,0 +1,26 @@
+{
+  "user_id": "A001",
+  "chat_context": {
+    "recent_messages": [
+      {
+        "role": "target",
+        "content": "哦"
+      },
+      {
+        "role": "me",
+        "content": "你今天怎么这么冷淡"
+      },
+      {
+        "role": "target",
+        "content": "没有啊"
+      }
+    ],
+    "previous_recent_messages": [
+      {
+        "role": "target",
+        "content": "哦"
+      }
+    ]
+  }
+}
+

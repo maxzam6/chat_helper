@@ -1,0 +1,4 @@
+# Core backend uses Python standard library.
+# Semantic retrieval uses these optional dependencies when installed.
+chromadb
+sentence-transformers
