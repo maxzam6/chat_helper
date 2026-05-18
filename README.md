@@ -6,7 +6,8 @@
 聊天输入
 -> InputFilter
 -> SQLite working memory
--> Dify 生成 retrieval_query
+-> LangGraph 状态图编排
+-> Dify 意图分类 / retrieval_query / reply / learning
 -> ChromaDB 语义召回 relevant_memories
 -> Dify 输出 reply / memory_updates / memory_reviews / updated_working_memory
 -> SQLite + ChromaDB 更新
@@ -19,6 +20,9 @@
 ```text
 memory_agent/
   agent.py          # Agent 编排主流程
+  graph_agent.py    # LangGraph 状态图 Agent 入口
+  state.py          # LangGraph AgentState
+  active_memory_cache.py # 当前用户相关记忆缓存
   dify_client.py    # Dify Workflow HTTP 客户端
   input_filter.py   # 空聊天、重复聊天过滤
   memory_store.py   # SQLite 长期记忆系统
@@ -51,7 +55,7 @@ CHROMA_DB_PATH=chroma_memory
 python main.py examples/sample_input.json
 ```
 
-如果没有配置 `DIFY_API_KEY`，程序会使用本地 mock 分析结果，方便先验证 SQLite 和 Agent 闭环。
+如果没有配置 `DIFY_API_KEY`，程序会使用本地 mock 输出，方便先验证 SQLite、LangGraph、语义召回和 memory 写回闭环。
 
 ## 依赖
 
@@ -59,10 +63,13 @@ python main.py examples/sample_input.json
 
 ```text
 chromadb
+langgraph
 sentence-transformers
 ```
 
-如果本地暂时没有安装这些依赖，`SemanticRetriever` 会自动降级到轻量 fallback，保证后端流程还能跑通。
+如果本地暂时没有安装 `chromadb` / `sentence-transformers`，`SemanticRetriever` 会自动降级到轻量 fallback，保证后端流程还能跑通。
+
+如果本地暂时没有安装 `langgraph`，`graph_agent.py` 内置了一个最小 fallback runner 用于本地测试；正式环境建议安装 `langgraph`。
 
 ## 测试
 

@@ -115,6 +115,57 @@ class MemoryStoreTest(unittest.TestCase):
             self.assertEqual(second["content"], "updated state")
             self.assertEqual(second["confidence"], 0.8)
 
+    def test_working_memory_observations_age_cleanup_and_trim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            store.init_db()
+
+            first = store.update_working_memory_observations(
+                "A001",
+                [
+                    {"content": "first", "confidence": 0.5, "ttl": 2},
+                    {"content": "second", "confidence": 0.9, "ttl": 5},
+                ],
+                max_items=2,
+            )
+
+            self.assertEqual([item["content"] for item in first], ["second", "first"])
+
+            second = store.update_working_memory_observations(
+                "A001",
+                [{"content": "third", "confidence": 0.8, "ttl": 5}],
+                max_items=2,
+            )
+
+            self.assertEqual([item["content"] for item in second], ["second", "third"])
+
+    def test_session_state_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            store.init_db()
+
+            store.save_session_state(
+                "me",
+                "A001",
+                {
+                    "last_intent": "reply_advice",
+                    "last_user_input": "input",
+                    "last_input_summary": "summary",
+                    "last_reply": {"content": "reply"},
+                    "last_analysis": {"state": "ok"},
+                    "last_chat_context": {"recent_messages": []},
+                    "last_active_user_id": "A001",
+                    "last_retrieval_query": "query",
+                },
+            )
+
+            session = store.get_session_state("me", "A001")
+
+            self.assertEqual(session["last_reply"], {"content": "reply"})
+            self.assertEqual(session["last_analysis"], {"state": "ok"})
+            self.assertEqual(session["last_chat_context"], {"recent_messages": []})
+            self.assertEqual(session["last_retrieval_query"], "query")
+
 
 if __name__ == "__main__":
     unittest.main()

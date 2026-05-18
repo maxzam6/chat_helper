@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
 from typing import Any
 
 
@@ -110,6 +111,31 @@ class SemanticRetriever:
             return
 
         self._collection.delete(ids=[item_id])
+
+    def embed_text(self, text: str) -> list[float] | None:
+        """Return an embedding when the sentence-transformers model is available."""
+        text = text.strip()
+        if not text or self._model is None:
+            return None
+        try:
+            return self._embed(text)
+        except Exception:
+            return None
+
+    def cosine_similarity(
+        self,
+        vec1: list[float] | None,
+        vec2: list[float] | None,
+    ) -> float:
+        """Compute cosine similarity for two vectors; return 0.0 on bad input."""
+        if not vec1 or not vec2 or len(vec1) != len(vec2):
+            return 0.0
+        dot = sum(a * b for a, b in zip(vec1, vec2))
+        norm1 = math.sqrt(sum(a * a for a in vec1))
+        norm2 = math.sqrt(sum(b * b for b in vec2))
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        return dot / (norm1 * norm2)
 
     def _init_chroma(self) -> None:
         try:

@@ -161,6 +161,36 @@ def extract_reply(dify_output: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def extract_intent_result(dify_output: dict[str, Any]) -> dict[str, str]:
+    """Extract intent classification output."""
+    result = _extract_dict_field(dify_output, "intent_result")
+    if not result:
+        result = {
+            "intent": _extract_string_field(dify_output, "intent"),
+            "input_summary": _extract_string_field(dify_output, "input_summary"),
+        }
+    return {
+        "intent": result.get("intent") or "general_question",
+        "input_summary": result.get("input_summary") or "",
+    }
+
+
+def extract_chat_context(dify_output: dict[str, Any]) -> dict[str, Any]:
+    """Extract chat_context from OCR/Vision output."""
+    return _extract_dict_field(dify_output, "chat_context")
+
+
+def extract_working_memory_observations(dify_output: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract working memory observation list from Dify output."""
+    observations = _extract_list_field(dify_output, "working_memory_observations")
+    return [item for item in observations if isinstance(item, dict)]
+
+
+def extract_changed_summary(dify_output: dict[str, Any]) -> str:
+    """Extract profile/memory changed summary."""
+    return _extract_string_field(dify_output, "changed_summary")
+
+
 def parse_dify_result(dify_output: dict[str, Any]) -> dict[str, Any]:
     """Parse Dify End-node result JSON without raising on bad output."""
     result = dify_output.get("result")
@@ -185,6 +215,51 @@ def _outputs(dify_output: dict[str, Any]) -> dict[str, Any]:
     data = dify_output.get("data") or {}
     outputs = data.get("outputs") or {}
     return outputs if isinstance(outputs, dict) else {}
+
+
+def _extract_dict_field(dify_output: dict[str, Any], key: str) -> dict[str, Any]:
+    if isinstance(dify_output.get(key), dict):
+        return dify_output[key]
+
+    outputs = _outputs(dify_output)
+    if isinstance(outputs.get(key), dict):
+        return outputs[key]
+
+    result = parse_dify_result(dify_output)
+    if isinstance(result.get(key), dict):
+        return result[key]
+
+    return {}
+
+
+def _extract_list_field(dify_output: dict[str, Any], key: str) -> list[Any]:
+    if isinstance(dify_output.get(key), list):
+        return dify_output[key]
+
+    outputs = _outputs(dify_output)
+    if isinstance(outputs.get(key), list):
+        return outputs[key]
+
+    result = parse_dify_result(dify_output)
+    if isinstance(result.get(key), list):
+        return result[key]
+
+    return []
+
+
+def _extract_string_field(dify_output: dict[str, Any], key: str) -> str:
+    if isinstance(dify_output.get(key), str):
+        return dify_output[key].strip()
+
+    outputs = _outputs(dify_output)
+    if isinstance(outputs.get(key), str):
+        return outputs[key].strip()
+
+    result = parse_dify_result(dify_output)
+    if isinstance(result.get(key), str):
+        return result[key].strip()
+
+    return ""
 
 
 def _strip_markdown_json_block(text: str) -> str:
