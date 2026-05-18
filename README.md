@@ -1,77 +1,71 @@
-# 基于长期记忆机制的上下文感知智能对话 Agent
+# Context-Aware Memory Agent
 
-当前阶段实现一个最小可运行的 Python Backend：
+This project is a Python backend for a long-term memory conversation agent.
+
+Current main stack:
 
 ```text
-聊天输入
+chat input
 -> InputFilter
--> SQLite working memory
--> LangGraph 状态图编排
--> Dify 意图分类 / retrieval_query / reply / learning
--> ChromaDB 语义召回 relevant_memories
--> Dify 输出 reply / memory_updates / memory_reviews / updated_working_memory
--> SQLite + ChromaDB 更新
+-> LangGraph state graph
+-> Generic LLMClient tasks: intent / reply / ocr / retrieval_query / learning
+-> SQLite source of truth
+-> SemanticRetriever / ChromaDB recall index
+-> ActiveMemoryCache
+-> session_state + working_memory_observations
 ```
 
-本项目不负责 Dify 工作流搭建，只提供后端对接边界。
+The main chain does not depend on any fixed model platform. `LLMClient` is a thin abstraction that can later be connected to OpenAI, local models, Ollama, Tongyi, or other providers. `MockLLMClient` keeps the local loop runnable without real keys.
 
-## 项目结构
+## Project Structure
 
 ```text
 memory_agent/
-  agent.py          # Agent 编排主流程
-  graph_agent.py    # LangGraph 状态图 Agent 入口
-  state.py          # LangGraph AgentState
-  active_memory_cache.py # 当前用户相关记忆缓存
-  dify_client.py    # Dify Workflow HTTP 客户端
-  input_filter.py   # 空聊天、重复聊天过滤
-  memory_store.py   # SQLite 长期记忆系统
-  semantic_retriever.py # ChromaDB 语义检索索引
-  models.py         # 输入和输出数据结构辅助
+  graph_agent.py          # LangGraph GraphMemoryAgent main entry
+  llm_client.py           # Generic BaseLLMClient / MockLLMClient / LLMClient
+  state.py                # AgentState
+  active_memory_cache.py  # Active user memory cache
+  memory_store.py         # SQLite long-term/session/working memory storage
+  semantic_retriever.py   # ChromaDB semantic recall index with fallback
+  models.py               # Generic model output parsing helpers
+  input_filter.py         # Empty/duplicate chat filtering
+  agent.py                # Legacy sequential agent
 examples/
-  sample_input.json # 示例聊天输入
+  sample_input.json
 tests/
-  test_agent.py
-  test_input_filter.py
+  test_graph_agent_local.py
   test_memory_store.py
-main.py             # 命令行运行入口
+  test_semantic_retriever.py
+  test_models.py
+main.py
 ```
 
-## 环境变量
-
-复制 `.env.example` 后按你的 Dify 配置填写：
+## Environment
 
 ```text
-DIFY_API_BASE=https://api.dify.ai/v1
-DIFY_API_KEY=your-api-key
-DIFY_USER=memory-agent
 MEMORY_DB_PATH=memory.db
 CHROMA_DB_PATH=chroma_memory
 ```
 
-## 运行
+## Run
 
 ```bash
 python main.py examples/sample_input.json
 ```
 
-如果没有配置 `DIFY_API_KEY`，程序会使用本地 mock 输出，方便先验证 SQLite、LangGraph、语义召回和 memory 写回闭环。
+## Dependencies
 
-## 依赖
-
-基础 SQLite 流程只依赖 Python 标准库。语义检索使用：
+Core SQLite behavior uses the Python standard library. Optional graph and semantic retrieval dependencies:
 
 ```text
-chromadb
 langgraph
+chromadb
 sentence-transformers
 ```
 
-如果本地暂时没有安装 `chromadb` / `sentence-transformers`，`SemanticRetriever` 会自动降级到轻量 fallback，保证后端流程还能跑通。
+If `chromadb` / `sentence-transformers` are not installed or cannot load locally, `SemanticRetriever` falls back to a simple lexical index. If `langgraph` is not installed, `graph_agent.py` includes a minimal local runner for development tests.
 
-如果本地暂时没有安装 `langgraph`，`graph_agent.py` 内置了一个最小 fallback runner 用于本地测试；正式环境建议安装 `langgraph`。
-
-## 测试
+## Test
 
 ```bash
 python -m unittest discover -s tests

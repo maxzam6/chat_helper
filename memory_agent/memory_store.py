@@ -34,7 +34,7 @@ class MemoryStore:
     def init_db(self) -> None:
         """Create the current database schema.
 
-        The current stage does not need old-database migration, so the table
+        The current schema does not need old-database migration, so the table
         structure is declared directly here.
         """
         with closing(self._connect()) as conn:
@@ -97,7 +97,7 @@ class MemoryStore:
                 )
 
     def get_user_memory(self, user_id: str) -> list[str]:
-        """Return only stable long-term memory for normal Dify context."""
+        """Return only stable long-term memory for normal model context."""
         return [row["content"] for row in self._get_memory_rows_by_status(user_id, "stable")]
 
     def get_pending_memory(self, user_id: str) -> list[str]:
@@ -126,7 +126,7 @@ class MemoryStore:
         """Return full memory records for ids recalled by the vector index.
 
         ChromaDB/SemanticRetriever is only an index. Before sending relevant
-        memories to Dify, Agent calls this method so the final content comes
+        memories to the model, Agent calls this method so the final content comes
         from SQLite, which is the source of truth.
         """
         if not memory_ids:
@@ -221,7 +221,7 @@ class MemoryStore:
     def get_working_memory(self, user_id: str) -> dict[str, Any] | None:
         """Return the user's current working memory, or None if missing.
 
-        Python only stores and retrieves this value. Dify is responsible for
+        Python only stores and retrieves this value. The model is responsible for
         deciding what the working memory content should be.
         """
         with closing(self._connect()) as conn:
@@ -242,7 +242,7 @@ class MemoryStore:
         content: str,
         confidence: float = 0.8,
     ) -> None:
-        """Replace the user's working memory with Dify's latest summary.
+        """Replace the user's working memory with the model's latest summary.
 
         This is an upsert: it inserts the row when missing and overwrites content,
         confidence, and updated_at when the user already has working memory.
@@ -270,7 +270,7 @@ class MemoryStore:
     def get_working_memory_observations(self, user_id: str) -> list[dict[str, Any]]:
         """Return active short-term observations for one user.
 
-        These rows are a queue, not a summary. Dify generates observation text;
+        These rows are a queue, not a summary. The model generates observation text;
         Python only manages age, ttl, ordering, and max size.
         """
         with closing(self._connect()) as conn:

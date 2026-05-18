@@ -7,7 +7,7 @@ from typing import Any
 
 
 class DifyClient:
-    """Thin Dify Workflow HTTP client.
+    """Legacy Dify Workflow HTTP client.
 
     Python sends structured inputs to Dify and reads structured outputs back.
     Prompts, vision reasoning, reply generation, and learning logic stay in Dify.
@@ -28,8 +28,9 @@ class DifyClient:
     def run_workflow(self, inputs: dict[str, Any]) -> dict[str, Any]:
         """Run Dify Workflow once.
 
-        GraphMemoryAgent uses stages such as intent_classifier, reply, ocr,
-        retrieval_query, and learning. Real prompts remain inside Dify.
+        The legacy sequential MemoryAgent passes task markers such as
+        retrieval_query and learning. New GraphMemoryAgent code does not use
+        this client.
         """
         if not self.api_key:
             return self._mock_response(inputs)

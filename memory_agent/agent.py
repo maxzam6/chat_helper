@@ -6,7 +6,6 @@ from .dify_client import DifyClient
 from .input_filter import InputFilter
 from .memory_store import MemoryStore, classify_memory_status
 from .models import (
-    build_dify_inputs,
     extract_memory_review,
     extract_memory_reviews,
     extract_memory_updates,
@@ -15,6 +14,33 @@ from .models import (
     extract_updated_working_memory,
 )
 from .semantic_retriever import SemanticRetriever
+
+
+def build_dify_inputs(
+    payload: dict[str, Any],
+    memory: list[str] | None = None,
+    working_memory: dict[str, Any] | None = None,
+    relevant_memories: list[dict[str, Any]] | None = None,
+    stage: str = "learning",
+) -> dict[str, Any]:
+    """Legacy helper used only by the old sequential MemoryAgent."""
+    chat_context = payload.get("chat_context") or {}
+    recent_messages = chat_context.get("recent_messages") or []
+    chat_text = "\n".join(
+        f"{message.get('role', '')}: {message.get('content', '')}"
+        for message in recent_messages
+    )
+    return {
+        "stage": stage,
+        "chatText": chat_text,
+        "info": {
+            "user_id": payload["user_id"],
+            "memory": memory or [],
+            "working_memory": working_memory,
+            "relevant_memories": relevant_memories or [],
+            "chat_context": chat_context,
+        },
+    }
 
 
 class MemoryAgent:

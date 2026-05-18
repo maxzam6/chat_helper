@@ -3,19 +3,18 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from memory_agent.dify_client import DifyClient
 from memory_agent.graph_agent import GraphMemoryAgent
+from memory_agent.llm_client import MockLLMClient
 from memory_agent.memory_store import MemoryStore
 
 
-class RecordingDifyClient(DifyClient):
+class RecordingLLMClient(MockLLMClient):
     def __init__(self) -> None:
-        super().__init__(api_key=None)
-        self.stages: list[str] = []
+        self.tasks: list[str] = []
 
-    def run_workflow(self, inputs: dict[str, Any]) -> dict[str, Any]:
-        self.stages.append(inputs.get("stage", ""))
-        return super().run_workflow(inputs)
+    def generate_json(self, task: str, inputs: dict[str, Any]) -> dict[str, Any]:
+        self.tasks.append(task)
+        return super().generate_json(task, inputs)
 
 
 class EmptyRetriever:
@@ -67,69 +66,67 @@ class EmptyRetriever:
 def make_chat_context() -> dict[str, Any]:
     return {
         "recent_messages": [
-            {"role": "target", "content": "ok"},
-            {"role": "me", "content": "怎么回比较自然"},
+            {"role": "user", "content": "哦"},
+            {"role": "me", "content": "你是不是不想聊了"},
         ],
-        "previous_recent_messages": [{"role": "target", "content": "ok"}],
+        "previous_recent_messages": [],
     }
 
 
-class GraphMemoryAgentTest(unittest.TestCase):
+class GraphMemoryAgentLocalTest(unittest.TestCase):
     def test_general_question_does_not_require_current_user(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(Path(tmp) / "memory.db")
-            dify = RecordingDifyClient()
-            agent = GraphMemoryAgent(store, dify, semantic_retriever=EmptyRetriever())  # type: ignore[arg-type]
+            llm = RecordingLLMClient()
+            agent = GraphMemoryAgent(store, llm, semantic_retriever=EmptyRetriever())  # type: ignore[arg-type]
 
             result = agent.process({"me_id": "default", "user_input": "LangGraph 是什么？"})
 
             self.assertEqual(result["intent"], "general_question")
             self.assertTrue(result["reply"])
-            self.assertEqual(dify.stages, ["intent_classifier", "reply"])
+            self.assertEqual(llm.tasks, ["intent_classifier", "reply"])
             self.assertIsNotNone(store.get_session_state("default", "global"))
             self.assertEqual(store.get_user_memory("A001"), [])
 
     def test_revise_reply_uses_last_session_reply_without_retrieval_or_learning(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(Path(tmp) / "memory.db")
-            dify = RecordingDifyClient()
-            agent = GraphMemoryAgent(store, dify, semantic_retriever=EmptyRetriever())  # type: ignore[arg-type]
+            llm = RecordingLLMClient()
+            agent = GraphMemoryAgent(store, llm, semantic_retriever=EmptyRetriever())  # type: ignore[arg-type]
 
             agent.process({"me_id": "default", "user_input": "LangGraph 是什么？"})
-            dify.stages.clear()
+            llm.tasks.clear()
             result = agent.process({"me_id": "default", "user_input": "短一点，自然一点"})
 
             self.assertEqual(result["intent"], "revise_reply")
             self.assertTrue(result["reply"])
-            self.assertEqual(dify.stages, ["intent_classifier", "reply"])
-            self.assertNotIn("retrieval_query", dify.stages)
-            self.assertNotIn("learning", dify.stages)
+            self.assertEqual(llm.tasks, ["intent_classifier", "reply"])
+            self.assertNotIn("ocr", llm.tasks)
+            self.assertNotIn("retrieval_query", llm.tasks)
+            self.assertNotIn("learning", llm.tasks)
 
-    def test_reply_advice_runs_memory_workflow(self):
+    def test_reply_advice_runs_memory_flow(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(Path(tmp) / "memory.db")
-            dify = RecordingDifyClient()
+            llm = RecordingLLMClient()
             retriever = EmptyRetriever()
-            agent = GraphMemoryAgent(store, dify, semantic_retriever=retriever)  # type: ignore[arg-type]
+            agent = GraphMemoryAgent(store, llm, semantic_retriever=retriever)  # type: ignore[arg-type]
 
             result = agent.process(
                 {
                     "me_id": "default",
                     "current_user_id": "A001",
-                    "user_input": "这句怎么回？",
+                    "user_input": "她回我哦，我该怎么回？",
                     "chat_context": make_chat_context(),
                     "working_memory_observations": [
-                        {
-                            "content": "The current chat needs a soft reply.",
-                            "confidence": 0.8,
-                        }
+                        {"content": "The current chat needs a soft reply.", "confidence": 0.8}
                     ],
                 }
             )
 
             self.assertEqual(result["intent"], "reply_advice")
-            self.assertIn("retrieval_query", dify.stages)
-            self.assertIn("learning", dify.stages)
+            self.assertIn("retrieval_query", llm.tasks)
+            self.assertIn("learning", llm.tasks)
             self.assertTrue(result["reply"])
             self.assertTrue(result["saved_memory_ids"])
             self.assertTrue(store.get_user_memory("A001"))
@@ -140,8 +137,8 @@ class GraphMemoryAgentTest(unittest.TestCase):
     def test_profile_update_skips_ocr_and_updates_memory(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(Path(tmp) / "memory.db")
-            dify = RecordingDifyClient()
-            agent = GraphMemoryAgent(store, dify, semantic_retriever=EmptyRetriever())  # type: ignore[arg-type]
+            llm = RecordingLLMClient()
+            agent = GraphMemoryAgent(store, llm, semantic_retriever=EmptyRetriever())  # type: ignore[arg-type]
 
             result = agent.process(
                 {
@@ -152,9 +149,9 @@ class GraphMemoryAgentTest(unittest.TestCase):
             )
 
             self.assertEqual(result["intent"], "profile_update")
-            self.assertNotIn("ocr", dify.stages)
-            self.assertIn("retrieval_query", dify.stages)
-            self.assertIn("learning", dify.stages)
+            self.assertNotIn("ocr", llm.tasks)
+            self.assertIn("retrieval_query", llm.tasks)
+            self.assertIn("learning", llm.tasks)
             self.assertTrue(result["saved_memory_ids"])
             self.assertTrue(result["reply"])
             self.assertTrue(store.get_user_memory("A001"))

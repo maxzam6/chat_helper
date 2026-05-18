@@ -4,7 +4,7 @@ from typing import Any, Callable
 
 try:
     from langgraph.graph import END, START, StateGraph
-except Exception:  # pragma: no cover - exercised only when langgraph is missing
+except Exception:  # pragma: no cover
     START = "__start__"
     END = "__end__"
 
@@ -51,8 +51,8 @@ except Exception:  # pragma: no cover - exercised only when langgraph is missing
             return state
 
 from .active_memory_cache import ActiveMemoryCache
-from .dify_client import DifyClient
 from .input_filter import InputFilter
+from .llm_client import BaseLLMClient, MockLLMClient
 from .memory_store import MemoryStore, classify_memory_status
 from .models import (
     extract_changed_summary,
@@ -73,22 +73,18 @@ ALLOWED_INTENTS = {"general_question", "revise_reply", "reply_advice", "profile_
 
 
 class GraphMemoryAgent:
-    """LangGraph-based memory agent.
-
-    This class keeps the same storage/retrieval/Dify boundaries as the legacy
-    MemoryAgent, but moves orchestration into a StateGraph.
-    """
+    """LangGraph-based memory agent using a generic model client."""
 
     def __init__(
         self,
         memory_store: MemoryStore,
-        dify_client: DifyClient,
+        llm_client: BaseLLMClient | None = None,
         input_filter: InputFilter | None = None,
         semantic_retriever: SemanticRetriever | None = None,
         active_memory_cache: ActiveMemoryCache | None = None,
     ) -> None:
         self.memory_store = memory_store
-        self.dify_client = dify_client
+        self.llm_client = llm_client or MockLLMClient()
         self.input_filter = input_filter or InputFilter()
         self.semantic_retriever = semantic_retriever or SemanticRetriever()
         self.active_memory_cache = active_memory_cache or ActiveMemoryCache()
@@ -132,21 +128,15 @@ class GraphMemoryAgent:
                 "profile_update": "check_user_context",
             },
         )
-
         graph.add_edge("reply_general", "save_session_state")
-
         graph.add_edge("load_session_state", "check_last_reply")
         graph.add_conditional_edges(
             "check_last_reply",
             self.route_last_reply,
-            {
-                "has_last_reply": "revise_reply",
-                "no_last_reply": "reply_missing_context",
-            },
+            {"has_last_reply": "revise_reply", "no_last_reply": "reply_missing_context"},
         )
         graph.add_edge("reply_missing_context", "save_session_state")
         graph.add_edge("revise_reply", "save_session_state")
-
         graph.add_conditional_edges(
             "check_user_context",
             self.route_after_user_context,
@@ -157,50 +147,35 @@ class GraphMemoryAgent:
             },
         )
         graph.add_edge("reply_missing_user_id", "save_session_state")
-
         graph.add_edge("take_screenshot_or_mock", "ocr_vision_llm")
         graph.add_edge("ocr_vision_llm", "input_filter")
         graph.add_conditional_edges(
             "input_filter",
             self.route_input_filter,
-            {
-                "skipped": "reply_input_skipped",
-                "ok": "update_working_memory",
-            },
+            {"skipped": "reply_input_skipped", "ok": "update_working_memory"},
         )
         graph.add_edge("reply_input_skipped", "save_session_state")
         graph.add_edge("update_working_memory", "retrieval_query_llm")
-
         graph.add_edge("retrieval_query_llm", "query_similarity_check")
         graph.add_conditional_edges(
             "query_similarity_check",
             self.route_cache,
-            {
-                "reuse_cache": "reuse_cache",
-                "retrieve_and_build_cache": "retrieve_and_build_cache",
-            },
+            {"reuse_cache": "reuse_cache", "retrieve_and_build_cache": "retrieve_and_build_cache"},
         )
         graph.add_edge("reuse_cache", "after_cache")
         graph.add_edge("retrieve_and_build_cache", "after_cache")
         graph.add_conditional_edges(
             "after_cache",
             self.route_after_cache,
-            {
-                "reply_advice": "reply_advice_llm",
-                "profile_update": "learning_llm",
-            },
+            {"reply_advice": "reply_advice_llm", "profile_update": "learning_llm"},
         )
-
         graph.add_edge("reply_advice_llm", "learning_llm")
         graph.add_edge("learning_llm", "update_cache_from_learning")
         graph.add_edge("update_cache_from_learning", "sync_dirty_memory")
         graph.add_conditional_edges(
             "sync_dirty_memory",
             self.route_after_sync,
-            {
-                "reply_advice": "save_session_state",
-                "profile_update": "profile_update_confirm_reply",
-            },
+            {"reply_advice": "save_session_state", "profile_update": "profile_update_confirm_reply"},
         )
         graph.add_edge("profile_update_confirm_reply", "save_session_state")
         graph.add_edge("save_session_state", END)
@@ -208,17 +183,16 @@ class GraphMemoryAgent:
 
     def process(self, payload: dict[str, Any]) -> dict[str, Any]:
         self.memory_store.init_db()
-        initial_state = self._initial_state(payload)
-        return self.app.invoke(initial_state)
+        return self.app.invoke(self._initial_state(payload))
 
     def classify_intent(self, state: AgentState) -> dict[str, Any]:
-        output = self.dify_client.run_workflow(
-            {
-                "stage": "intent_classifier",
+        output = self.llm_client.generate_json(
+            task="intent_classifier",
+            inputs={
                 "user_input": state.get("user_input", ""),
                 "me_id": state.get("me_id"),
                 "current_user_id": state.get("current_user_id"),
-            }
+            },
         )
         result = extract_intent_result(output)
         intent = result.get("intent") or "general_question"
@@ -231,18 +205,15 @@ class GraphMemoryAgent:
         }
 
     def reply_general(self, state: AgentState) -> dict[str, Any]:
-        session_state = self.memory_store.get_session_state(
-            state.get("me_id") or "default",
-            "global",
-        )
-        output = self.dify_client.run_workflow(
-            {
-                "stage": "reply",
+        session_state = self.memory_store.get_session_state(state.get("me_id") or "default", "global")
+        output = self.llm_client.generate_json(
+            task="reply",
+            inputs={
                 "intent": "general_question",
                 "user_input": state.get("user_input", ""),
                 "input_summary": state.get("input_summary", ""),
                 "session_state": session_state,
-            }
+            },
         )
         return {"reply": extract_reply(output), "session_state": session_state, "status": "processed"}
 
@@ -259,10 +230,7 @@ class GraphMemoryAgent:
         current_user_id = state.get("current_user_id")
         last_active_user_id = session_state.get("last_active_user_id")
         if current_user_id and last_active_user_id and current_user_id != last_active_user_id:
-            return {
-                "last_reply": None,
-                "error": "last_reply_belongs_to_another_user",
-            }
+            return {"last_reply": None, "error": "last_reply_belongs_to_another_user"}
         return {"last_reply": session_state.get("last_reply")}
 
     def reply_missing_context(self, state: AgentState) -> dict[str, Any]:
@@ -277,16 +245,16 @@ class GraphMemoryAgent:
 
     def revise_reply(self, state: AgentState) -> dict[str, Any]:
         session_state = state.get("session_state") or {}
-        output = self.dify_client.run_workflow(
-            {
-                "stage": "reply",
+        output = self.llm_client.generate_json(
+            task="reply",
+            inputs={
                 "intent": "revise_reply",
                 "input_summary": state.get("input_summary", ""),
                 "last_reply": session_state.get("last_reply"),
                 "last_analysis": session_state.get("last_analysis"),
                 "last_chat_context": session_state.get("last_chat_context"),
                 "last_intent": session_state.get("last_intent"),
-            }
+            },
         )
         return {"reply": extract_reply(output), "status": "processed"}
 
@@ -299,10 +267,7 @@ class GraphMemoryAgent:
             self._sync_dirty_memory_entries(self.active_memory_cache.get_dirty_memories())
             self.active_memory_cache.clear()
 
-        session_state = self.memory_store.get_session_state(
-            state.get("me_id") or "default",
-            current_user_id,
-        )
+        session_state = self.memory_store.get_session_state(state.get("me_id") or "default", current_user_id)
         working_memory = self.memory_store.get_working_memory_observations(current_user_id)
         return {
             "active_user_id": current_user_id,
@@ -331,36 +296,31 @@ class GraphMemoryAgent:
         if state.get("chat_context"):
             return {"chat_text": messages_to_chat_text(state.get("chat_context", {}).get("recent_messages", []))}
 
-        output = self.dify_client.run_workflow(
-            {
-                "stage": "ocr",
+        output = self.llm_client.generate_json(
+            task="ocr",
+            inputs={
                 "user_input": state.get("user_input", ""),
                 "screenshot_base64": state.get("screenshot_base64"),
                 "screenshot_path": state.get("screenshot_path"),
-            }
+                "chat_context": state.get("chat_context", {}),
+            },
         )
         chat_context = extract_chat_context(output)
-        observations = extract_working_memory_observations(output)
         return {
             "chat_context": chat_context,
             "chat_text": messages_to_chat_text(chat_context.get("recent_messages", [])),
-            "working_memory_observations": observations,
+            "working_memory_observations": extract_working_memory_observations(output),
         }
 
     def input_filter_node(self, state: AgentState) -> dict[str, Any]:
-        payload = {"chat_context": state.get("chat_context") or {}}
-        result = self.input_filter.check(payload)
+        result = self.input_filter.check({"chat_context": state.get("chat_context") or {}})
         if not result.should_process:
             return {"status": "skipped", "error": result.reason}
         return {"status": "input_ready"}
 
     def reply_input_skipped(self, state: AgentState) -> dict[str, Any]:
         return {
-            "reply": {
-                "should_reply": False,
-                "content": "",
-                "reason": state.get("error") or "input_skipped",
-            },
+            "reply": {"should_reply": False, "content": "", "reason": state.get("error") or "input_skipped"},
             "memory_saved": False,
         }
 
@@ -368,51 +328,38 @@ class GraphMemoryAgent:
         user_id = state.get("active_user_id") or state.get("current_user_id")
         if not user_id:
             return {}
-        observations = state.get("working_memory_observations") or []
         working_memory = self.memory_store.update_working_memory_observations(
             user_id,
-            observations,
+            state.get("working_memory_observations") or [],
         )
         return {"working_memory": working_memory}
 
     def retrieval_query_llm(self, state: AgentState) -> dict[str, Any]:
-        output = self.dify_client.run_workflow(
-            {
-                "stage": "retrieval_query",
+        output = self.llm_client.generate_json(
+            task="retrieval_query",
+            inputs={
                 "intent": state.get("intent"),
                 "user_input": state.get("user_input", ""),
                 "input_summary": state.get("input_summary", ""),
                 "chat_context": state.get("chat_context", {}),
-                "chatText": state.get("chat_text", ""),
+                "chat_text": state.get("chat_text", ""),
                 "working_memory": state.get("working_memory", []),
-            }
+            },
         )
-        retrieval_query = extract_retrieval_query(output)
-        return {"retrieval_query": retrieval_query}
+        return {"retrieval_query": extract_retrieval_query(output)}
 
     def query_similarity_check(self, state: AgentState) -> dict[str, Any]:
-        retrieval_query = state.get("retrieval_query", "")
-        last_query = state.get("last_retrieval_query")
-        current_embedding = self.semantic_retriever.embed_text(retrieval_query)
-        last_embedding = self.semantic_retriever.embed_text(last_query or "")
+        current_embedding = self.semantic_retriever.embed_text(state.get("retrieval_query", ""))
+        last_embedding = self.semantic_retriever.embed_text(state.get("last_retrieval_query") or "")
         similarity = self.semantic_retriever.cosine_similarity(current_embedding, last_embedding)
-        reuse_cache = (
-            similarity >= 0.85
-            and self.active_memory_cache.has_cache(state.get("active_user_id"))
-        )
-        return {
-            "query_similarity": similarity,
-            "reuse_cache": reuse_cache,
-        }
+        reuse_cache = similarity >= 0.85 and self.active_memory_cache.has_cache(state.get("active_user_id"))
+        return {"query_similarity": similarity, "reuse_cache": reuse_cache}
 
     def reuse_cache(self, state: AgentState) -> dict[str, Any]:
         if not self.active_memory_cache.has_cache(state.get("active_user_id")):
             return self.retrieve_and_build_cache(state)
         memories = self.active_memory_cache.get_memories()
-        return {
-            "active_memory_cache": self.active_memory_cache.to_dict(),
-            "relevant_memories": memories,
-        }
+        return {"active_memory_cache": self.active_memory_cache.to_dict(), "relevant_memories": memories}
 
     def retrieve_and_build_cache(self, state: AgentState) -> dict[str, Any]:
         user_id = state.get("active_user_id") or state.get("current_user_id")
@@ -423,11 +370,7 @@ class GraphMemoryAgent:
             top_k=5,
             statuses=["stable", "pending", "conflict"],
         )
-        memory_ids = [
-            int(result["memory_id"])
-            for result in semantic_results
-            if result.get("memory_id") is not None
-        ]
+        memory_ids = [int(result["memory_id"]) for result in semantic_results if result.get("memory_id") is not None]
         records = [
             record
             for record in self.memory_store.get_memory_records(memory_ids)
@@ -451,27 +394,27 @@ class GraphMemoryAgent:
             for memory in self.active_memory_cache.get_memories(["stable"])
             if memory.get("user_id") == state.get("active_user_id")
         ]
-        output = self.dify_client.run_workflow(
-            {
-                "stage": "reply",
+        output = self.llm_client.generate_json(
+            task="reply",
+            inputs={
                 "intent": "reply_advice",
                 "chat_context": state.get("chat_context", {}),
                 "input_summary": state.get("input_summary", ""),
                 "working_memory": state.get("working_memory", []),
                 "memories": stable_memories,
-            }
+            },
         )
         return {"reply": extract_reply(output)}
 
     def learning_llm(self, state: AgentState) -> dict[str, Any]:
-        output = self.dify_client.run_workflow(
-            {
-                "stage": "learning",
+        output = self.llm_client.generate_json(
+            task="learning",
+            inputs={
                 "intent": state.get("intent"),
                 "chat_context": state.get("chat_context", {}),
                 "input_summary": state.get("input_summary", ""),
                 "memories": self.active_memory_cache.get_memories(),
-            }
+            },
         )
         return {
             "memory_updates": extract_memory_updates(output),
@@ -503,19 +446,16 @@ class GraphMemoryAgent:
         dirty_memories = self.active_memory_cache.get_dirty_memories()
         self._sync_dirty_memory_entries(dirty_memories)
         self.active_memory_cache.clear_dirty()
-        return {
-            "dirty_memories": dirty_memories,
-            "active_memory_cache": self.active_memory_cache.to_dict(),
-        }
+        return {"dirty_memories": dirty_memories, "active_memory_cache": self.active_memory_cache.to_dict()}
 
     def profile_update_confirm_reply(self, state: AgentState) -> dict[str, Any]:
-        output = self.dify_client.run_workflow(
-            {
-                "stage": "reply",
+        output = self.llm_client.generate_json(
+            task="reply",
+            inputs={
                 "intent": "profile_update",
                 "input_summary": state.get("input_summary", ""),
                 "changed_summary": state.get("changed_summary"),
-            }
+            },
         )
         return {"reply": extract_reply(output)}
 

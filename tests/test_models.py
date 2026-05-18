@@ -9,48 +9,34 @@ from memory_agent.models import (
     extract_reply,
     extract_retrieval_query,
     extract_updated_working_memory,
-    parse_dify_result,
+    parse_llm_json,
 )
 
 
 class ModelsTest(unittest.TestCase):
-    def test_parse_dify_result_from_result_string(self):
+    def test_parse_llm_json_from_result_string(self):
         payload = {"retrieval_query": "relationship pressure"}
 
-        self.assertEqual(
-            parse_dify_result({"result": json.dumps(payload)}),
-            payload,
-        )
+        self.assertEqual(parse_llm_json(json.dumps(payload)), payload)
 
-    def test_parse_dify_result_from_data_outputs_result_string(self):
-        payload = {"retrieval_query": "avoidance tendency"}
-
-        self.assertEqual(
-            parse_dify_result({"data": {"outputs": {"result": json.dumps(payload)}}}),
-            payload,
-        )
-
-    def test_parse_dify_result_from_result_dict(self):
+    def test_parse_llm_json_from_dict(self):
         payload = {"reply": {"should_reply": True, "content": "ok"}}
 
-        self.assertEqual(parse_dify_result({"result": payload}), payload)
+        self.assertEqual(parse_llm_json(payload), payload)
 
-    def test_parse_dify_result_from_markdown_json_block(self):
+    def test_parse_llm_json_from_markdown_json_block(self):
         result = """```json
 {
   "retrieval_query": "negative trigger"
 }
 ```"""
 
-        self.assertEqual(
-            parse_dify_result({"result": result}),
-            {"retrieval_query": "negative trigger"},
-        )
+        self.assertEqual(parse_llm_json(result), {"retrieval_query": "negative trigger"})
 
-    def test_parse_dify_result_returns_empty_on_bad_or_missing_result(self):
-        self.assertEqual(parse_dify_result({}), {})
-        self.assertEqual(parse_dify_result({"result": "not json"}), {})
-        self.assertEqual(parse_dify_result({"result": "[1, 2, 3]"}), {})
+    def test_parse_llm_json_returns_empty_on_bad_content(self):
+        self.assertEqual(parse_llm_json(None), {})
+        self.assertEqual(parse_llm_json("not json"), {})
+        self.assertEqual(parse_llm_json("[1, 2, 3]"), {})
 
     def test_extract_retrieval_query_supports_direct_outputs_and_result(self):
         self.assertEqual(extract_retrieval_query({"retrieval_query": "direct"}), "direct")
@@ -95,10 +81,7 @@ class ModelsTest(unittest.TestCase):
         self.assertEqual(extract_reply(output), result["reply"])
         self.assertEqual(extract_memory_updates(output), result["memory_updates"])
         self.assertEqual(extract_memory_reviews(output), result["memory_reviews"])
-        self.assertEqual(
-            extract_updated_working_memory(output),
-            result["updated_working_memory"],
-        )
+        self.assertEqual(extract_updated_working_memory(output), result["updated_working_memory"])
 
     def test_extract_legacy_single_fields_from_result_string(self):
         result = {
