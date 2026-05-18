@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import sqlite3
 from pathlib import Path
 
 from memory_agent.memory_store import MemoryStore, classify_memory_status
@@ -50,7 +51,16 @@ class MemoryStoreTest(unittest.TestCase):
             store = MemoryStore(Path(tmp) / "memory.db")
             store.init_db()
 
-            first_id = store.save_memory("A001", "style", "first fact", 0.8, "stable")
+            first_id = store.save_memory(
+                "A001",
+                "style",
+                "first fact",
+                0.8,
+                "stable",
+                source_type="reply_advice",
+                source_summary="first summary",
+                last_evidence="first evidence",
+            )
             second_id = store.save_memory("A001", "trigger", "second fact", 0.9, "stable")
 
             records = store.get_memory_records([second_id, 9999, first_id, second_id])
@@ -61,6 +71,10 @@ class MemoryStoreTest(unittest.TestCase):
             self.assertEqual(records[0]["confidence"], 0.9)
             self.assertEqual(records[0]["memory_status"], "stable")
             self.assertIn("created_at", records[0])
+            self.assertIn("updated_at", records[0])
+            self.assertEqual(records[1]["source_type"], "reply_advice")
+            self.assertEqual(records[1]["source_summary"], "first summary")
+            self.assertEqual(records[1]["last_evidence"], "first evidence")
 
     def test_update_memory_status(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -86,6 +100,63 @@ class MemoryStoreTest(unittest.TestCase):
             self.assertEqual(store.review_memory_status(memory_id, 0.9, has_conflict=True), "conflict")
             self.assertEqual(store.get_conflict_memory("A001"), ["pending fact"])
             self.assertIsNone(store.review_memory_status(9999, 0.8))
+
+    def test_update_memory_review_updates_confidence_status_and_timestamp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            store.init_db()
+
+            memory_id = store.save_memory("A001", "style", "review fact", 0.8, "stable")
+            self.assertTrue(store.update_memory_review(memory_id, 0.4, "discard"))
+            record = store.get_memory_record(memory_id)
+
+            self.assertEqual(record["confidence"], 0.4)
+            self.assertEqual(record["memory_status"], "discard")
+            self.assertIsNotNone(record["updated_at"])
+
+    def test_init_db_migrates_old_user_memory_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "memory.db"
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE user_memory (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id TEXT NOT NULL,
+                        memory_type TEXT,
+                        content TEXT NOT NULL,
+                        confidence REAL DEFAULT 0.8,
+                        memory_status TEXT DEFAULT 'stable',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO user_memory (
+                        user_id,
+                        memory_type,
+                        content,
+                        confidence,
+                        memory_status
+                    )
+                    VALUES ('A001', 'style', 'old fact', 0.8, 'stable')
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            store = MemoryStore(db_path)
+            store.init_db()
+            old_record = store.get_memory_record(1)
+            new_id = store.save_memory("A001", "style", "new fact", 0.9, "stable")
+            new_record = store.get_memory_record(new_id)
+
+            self.assertIn("source_type", old_record)
+            self.assertIsNotNone(old_record["updated_at"])
+            self.assertIsNotNone(new_record["updated_at"])
 
     def test_invalid_memory_status_raises_error(self):
         with tempfile.TemporaryDirectory() as tmp:

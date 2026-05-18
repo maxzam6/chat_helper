@@ -181,9 +181,12 @@ class GraphMemoryAgent:
         graph.add_edge("save_session_state", END)
         return graph
 
-    def process(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def process(self, payload: dict[str, Any], return_full_state: bool = False) -> dict[str, Any]:
         self.memory_store.init_db()
-        return self.app.invoke(self._initial_state(payload))
+        state = self.app.invoke(self._initial_state(payload))
+        if return_full_state:
+            return state
+        return self._public_result(state)
 
     def classify_intent(self, state: AgentState) -> dict[str, Any]:
         output = self.llm_client.generate_json(
@@ -264,8 +267,20 @@ class GraphMemoryAgent:
             return {"status": "missing_user_id"}
 
         if self.active_memory_cache.user_id and self.active_memory_cache.user_id != current_user_id:
-            self._sync_dirty_memory_entries(self.active_memory_cache.get_dirty_memories())
+            context_switch_sync_result = None
+            dirty_memories = [dict(memory) for memory in self.active_memory_cache.get_dirty_memories()]
+            if dirty_memories:
+                context_switch_sync_result = self._sync_dirty_memory_entries(dirty_memories)
+                if context_switch_sync_result["sync_errors"]:
+                    return {
+                        "status": "sync_failed",
+                        "error": self._merge_error(state.get("error"), "context_switch_sync_failed"),
+                        "context_switch_sync_result": context_switch_sync_result,
+                    }
+                self.active_memory_cache.clear_dirty()
             self.active_memory_cache.clear()
+        else:
+            context_switch_sync_result = state.get("context_switch_sync_result")
 
         session_state = self.memory_store.get_session_state(state.get("me_id") or "default", current_user_id)
         working_memory = self.memory_store.get_working_memory_observations(current_user_id)
@@ -274,10 +289,20 @@ class GraphMemoryAgent:
             "session_state": session_state,
             "working_memory": working_memory,
             "last_retrieval_query": session_state.get("last_retrieval_query") if session_state else None,
+            "context_switch_sync_result": context_switch_sync_result,
             "status": "user_context_ready",
         }
 
     def reply_missing_user_id(self, state: AgentState) -> dict[str, Any]:
+        if state.get("status") == "sync_failed":
+            return {
+                "reply": {
+                    "should_reply": False,
+                    "content": "",
+                    "reason": "context_switch_sync_failed",
+                },
+                "status": "sync_failed",
+            }
         return {
             "reply": {
                 "should_reply": True,
@@ -293,19 +318,18 @@ class GraphMemoryAgent:
         return {"screenshot_path": state.get("screenshot_path") or "mock://screenshot"}
 
     def ocr_vision_llm(self, state: AgentState) -> dict[str, Any]:
-        if state.get("chat_context"):
-            return {"chat_text": messages_to_chat_text(state.get("chat_context", {}).get("recent_messages", []))}
-
+        existing_chat_context = state.get("chat_context") or {}
         output = self.llm_client.generate_json(
             task="ocr",
             inputs={
                 "user_input": state.get("user_input", ""),
+                "chat_context": existing_chat_context,
                 "screenshot_base64": state.get("screenshot_base64"),
                 "screenshot_path": state.get("screenshot_path"),
-                "chat_context": state.get("chat_context", {}),
             },
         )
-        chat_context = extract_chat_context(output)
+        llm_chat_context = extract_chat_context(output)
+        chat_context = existing_chat_context or llm_chat_context
         return {
             "chat_context": chat_context,
             "chat_text": messages_to_chat_text(chat_context.get("recent_messages", [])),
@@ -335,18 +359,26 @@ class GraphMemoryAgent:
         return {"working_memory": working_memory}
 
     def retrieval_query_llm(self, state: AgentState) -> dict[str, Any]:
-        output = self.llm_client.generate_json(
-            task="retrieval_query",
-            inputs={
-                "intent": state.get("intent"),
-                "user_input": state.get("user_input", ""),
-                "input_summary": state.get("input_summary", ""),
-                "chat_context": state.get("chat_context", {}),
-                "chat_text": state.get("chat_text", ""),
-                "working_memory": state.get("working_memory", []),
-            },
-        )
-        return {"retrieval_query": extract_retrieval_query(output)}
+        fallback_query = state.get("input_summary") or state.get("chat_text") or state.get("user_input", "")
+        try:
+            output = self.llm_client.generate_json(
+                task="retrieval_query",
+                inputs={
+                    "intent": state.get("intent"),
+                    "user_input": state.get("user_input", ""),
+                    "input_summary": state.get("input_summary", ""),
+                    "chat_context": state.get("chat_context", {}),
+                    "chat_text": state.get("chat_text", ""),
+                    "working_memory": state.get("working_memory", []),
+                },
+            )
+            retrieval_query = extract_retrieval_query(output) or fallback_query
+            return {"retrieval_query": retrieval_query}
+        except Exception as exc:
+            return {
+                "retrieval_query": fallback_query,
+                "error": self._merge_error(state.get("error"), f"retrieval_query_failed:{exc}"),
+            }
 
     def query_similarity_check(self, state: AgentState) -> dict[str, Any]:
         current_embedding = self.semantic_retriever.embed_text(state.get("retrieval_query", ""))
@@ -407,46 +439,75 @@ class GraphMemoryAgent:
         return {"reply": extract_reply(output)}
 
     def learning_llm(self, state: AgentState) -> dict[str, Any]:
-        output = self.llm_client.generate_json(
-            task="learning",
-            inputs={
-                "intent": state.get("intent"),
-                "chat_context": state.get("chat_context", {}),
-                "input_summary": state.get("input_summary", ""),
-                "memories": self.active_memory_cache.get_memories(),
-            },
-        )
-        return {
-            "memory_updates": extract_memory_updates(output),
-            "memory_reviews": extract_memory_reviews(output),
-            "changed_summary": extract_changed_summary(output),
-        }
+        try:
+            output = self.llm_client.generate_json(
+                task="learning",
+                inputs={
+                    "intent": state.get("intent"),
+                    "chat_context": state.get("chat_context", {}),
+                    "input_summary": state.get("input_summary", ""),
+                    "memories": self.active_memory_cache.get_memories(),
+                },
+            )
+            return {
+                "memory_updates": extract_memory_updates(output),
+                "memory_reviews": extract_memory_reviews(output),
+                "changed_summary": extract_changed_summary(output),
+            }
+        except Exception as exc:
+            return {
+                "memory_updates": [],
+                "memory_reviews": [],
+                "changed_summary": "",
+                "error": self._merge_error(state.get("error"), f"learning_failed:{exc}"),
+            }
 
     def update_cache_from_learning(self, state: AgentState) -> dict[str, Any]:
         user_id = state.get("active_user_id") or state.get("current_user_id")
-        saved_memory_ids: list[int] = []
         for memory_update in state.get("memory_updates", []):
-            memory_id = self._apply_memory_update(user_id or "", memory_update)
-            if memory_id is None:
+            content = str(memory_update.get("content", "")).strip()
+            if not content:
                 continue
-            saved_memory_ids.append(memory_id)
-            record = self.memory_store.get_memory_record(memory_id)
-            if record:
-                self.active_memory_cache.upsert_memory(record, dirty=True)
+            confidence = float(memory_update.get("confidence", 0.8))
+            has_conflict = memory_update.get("has_conflict") is True
+            memory_status = classify_memory_status(confidence, has_conflict)
+            if memory_status == "discard":
+                continue
+            self.active_memory_cache.add_pending_memory(
+                {
+                    "user_id": user_id,
+                    "memory_type": memory_update.get("memory_type"),
+                    "content": content,
+                    "confidence": confidence,
+                    "memory_status": memory_status,
+                    "source_type": state.get("intent") or "unknown",
+                    "source_summary": state.get("changed_summary") or state.get("input_summary"),
+                    "last_evidence": memory_update.get("evidence"),
+                }
+            )
 
-        reviewed_memories = self._apply_memory_reviews(state.get("memory_reviews", []))
+        reviewed_memories = self._apply_memory_reviews_to_cache(state.get("memory_reviews", []))
         return {
-            "saved_memory_ids": saved_memory_ids,
+            "saved_memory_ids": [],
             "reviewed_memories": reviewed_memories,
             "dirty_memories": self.active_memory_cache.get_dirty_memories(),
             "active_memory_cache": self.active_memory_cache.to_dict(),
         }
 
     def sync_dirty_memory(self, state: AgentState) -> dict[str, Any]:
-        dirty_memories = self.active_memory_cache.get_dirty_memories()
-        self._sync_dirty_memory_entries(dirty_memories)
-        self.active_memory_cache.clear_dirty()
-        return {"dirty_memories": dirty_memories, "active_memory_cache": self.active_memory_cache.to_dict()}
+        dirty_memories = [dict(memory) for memory in self.active_memory_cache.get_dirty_memories()]
+        sync_result = self._sync_dirty_memory_entries(dirty_memories)
+        if not sync_result["sync_errors"]:
+            self.active_memory_cache.clear_dirty()
+        return {
+            "dirty_memories": dirty_memories,
+            "saved_memory_ids": sync_result["saved_memory_ids"],
+            "reviewed_memories": sync_result["reviewed_memories"],
+            "discarded_memory_ids": sync_result["discarded_memory_ids"],
+            "sync_errors": sync_result["sync_errors"],
+            "active_memory_cache": self.active_memory_cache.to_dict(),
+            "error": self._merge_error(state.get("error"), "sync_failed") if sync_result["sync_errors"] else state.get("error"),
+        }
 
     def profile_update_confirm_reply(self, state: AgentState) -> dict[str, Any]:
         output = self.llm_client.generate_json(
@@ -460,20 +521,32 @@ class GraphMemoryAgent:
         return {"reply": extract_reply(output)}
 
     def save_session_state(self, state: AgentState) -> dict[str, Any]:
-        me_id = state.get("me_id") or "default"
-        user_id = self._session_user_id(state)
-        data = {
-            "last_intent": state.get("intent"),
-            "last_user_input": state.get("user_input"),
-            "last_input_summary": state.get("input_summary"),
-            "last_reply": state.get("reply"),
-            "last_analysis": (state.get("reply") or {}).get("analysis"),
-            "last_chat_context": state.get("chat_context"),
-            "last_active_user_id": state.get("active_user_id") or state.get("current_user_id"),
-            "last_retrieval_query": state.get("retrieval_query"),
-        }
-        self.memory_store.save_session_state(me_id, user_id, data)
-        return {"session_state_saved": True}
+        if state.get("status") in {"skipped", "missing_user_id", "missing_context", "sync_failed"}:
+            return {
+                "session_state_saved": False,
+                "reason": f"not_saved_for_status:{state.get('status')}",
+            }
+
+        try:
+            me_id = state.get("me_id") or "default"
+            user_id = self._session_user_id(state)
+            data = {
+                "last_intent": state.get("intent"),
+                "last_user_input": state.get("user_input"),
+                "last_input_summary": state.get("input_summary"),
+                "last_reply": state.get("reply"),
+                "last_analysis": (state.get("reply") or {}).get("analysis"),
+                "last_chat_context": state.get("chat_context"),
+                "last_active_user_id": state.get("active_user_id") or state.get("current_user_id"),
+                "last_retrieval_query": state.get("retrieval_query"),
+            }
+            self.memory_store.save_session_state(me_id, user_id, data)
+            return {"session_state_saved": True}
+        except Exception as exc:
+            return {
+                "session_state_saved": False,
+                "error": self._merge_error(state.get("error"), f"session_save_failed:{exc}"),
+            }
 
     def noop(self, state: AgentState) -> dict[str, Any]:
         return {}
@@ -486,7 +559,7 @@ class GraphMemoryAgent:
         return "has_last_reply" if state.get("last_reply") else "no_last_reply"
 
     def route_after_user_context(self, state: AgentState) -> str:
-        if state.get("status") == "missing_user_id":
+        if state.get("status") in {"missing_user_id", "sync_failed"}:
             return "missing_user_id"
         return state.get("intent") or "reply_advice"
 
@@ -502,24 +575,7 @@ class GraphMemoryAgent:
     def route_after_sync(self, state: AgentState) -> str:
         return "profile_update" if state.get("intent") == "profile_update" else "reply_advice"
 
-    def _apply_memory_update(self, user_id: str, memory_update: dict[str, Any]) -> int | None:
-        content = str(memory_update.get("content", "")).strip()
-        if not content:
-            return None
-        confidence = float(memory_update.get("confidence", 0.8))
-        has_conflict = memory_update.get("has_conflict") is True
-        memory_status = classify_memory_status(confidence, has_conflict)
-        if memory_status == "discard":
-            return None
-        return self.memory_store.save_memory(
-            user_id=user_id,
-            memory_type=memory_update.get("memory_type"),
-            content=content,
-            confidence=confidence,
-            memory_status=memory_status,
-        )
-
-    def _apply_memory_reviews(self, memory_reviews: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _apply_memory_reviews_to_cache(self, memory_reviews: list[dict[str, Any]]) -> list[dict[str, Any]]:
         reviewed: list[dict[str, Any]] = []
         for memory_review in memory_reviews:
             if "memory_id" not in memory_review or "confidence" not in memory_review:
@@ -527,34 +583,188 @@ class GraphMemoryAgent:
             memory_id = int(memory_review["memory_id"])
             confidence = float(memory_review["confidence"])
             has_conflict = memory_review.get("has_conflict") is True
-            new_status = self.memory_store.review_memory_status(memory_id, confidence, has_conflict)
-            record = self.memory_store.get_memory_record(memory_id)
-            if record:
-                self.active_memory_cache.upsert_memory(record, dirty=True)
+            memory_status = classify_memory_status(confidence, has_conflict)
+            record = self._get_cached_memory(memory_id) or self.memory_store.get_memory_record(memory_id)
+            if not record:
+                reviewed.append(
+                    {
+                        "memory_id": memory_id,
+                        "reviewed": False,
+                        "confidence": confidence,
+                        "has_conflict": has_conflict,
+                        "memory_status": memory_status,
+                    }
+                )
+                continue
+
+            updated_record = dict(record)
+            updated_record["confidence"] = confidence
+            updated_record["memory_status"] = memory_status
+            self.active_memory_cache.upsert_memory(updated_record, dirty=True)
             reviewed.append(
                 {
                     "memory_id": memory_id,
-                    "reviewed": new_status is not None,
+                    "reviewed": True,
                     "confidence": confidence,
                     "has_conflict": has_conflict,
-                    "memory_status": new_status,
+                    "memory_status": memory_status,
                 }
             )
         return reviewed
 
-    def _sync_dirty_memory_entries(self, dirty_memories: list[dict[str, Any]]) -> None:
+    def _sync_dirty_memory_entries(self, dirty_memories: list[dict[str, Any]]) -> dict[str, Any]:
+        saved_memory_ids: list[int] = []
+        reviewed_memories: list[dict[str, Any]] = []
+        discarded_memory_ids: list[int] = []
+        sync_errors: list[dict[str, Any]] = []
         for memory in dirty_memories:
-            memory_id = int(memory["id"])
-            if memory.get("memory_status") == "discard":
-                self.semantic_retriever.delete_memory(memory_id)
-                continue
-            self.semantic_retriever.add_memory(
-                memory_id=memory_id,
-                user_id=memory["user_id"],
-                content=memory["content"],
-                memory_status=memory["memory_status"],
-                memory_type=memory.get("memory_type"),
-            )
+            memory_id = memory.get("id")
+            memory_status = memory.get("memory_status")
+            confidence = float(memory.get("confidence", 0.8))
+            is_new_memory = memory.get("_is_new") is True or str(memory_id).startswith("tmp_")
+
+            try:
+                if is_new_memory:
+                    if memory_status == "discard":
+                        self.active_memory_cache.remove_memory(memory_id)
+                        continue
+                    real_id = self.memory_store.save_memory(
+                        user_id=memory["user_id"],
+                        memory_type=memory.get("memory_type"),
+                        content=memory["content"],
+                        confidence=confidence,
+                        memory_status=memory_status,
+                        source_type=memory.get("source_type") or "unknown",
+                        source_summary=memory.get("source_summary"),
+                        last_evidence=memory.get("last_evidence"),
+                    )
+                    saved_memory_ids.append(real_id)
+                    real_record = self.memory_store.get_memory_record(real_id)
+                    if real_record:
+                        self.active_memory_cache.replace_memory_id(str(memory_id), real_id, real_record)
+                    try:
+                        self.semantic_retriever.add_memory(
+                            memory_id=real_id,
+                            user_id=memory["user_id"],
+                            content=memory["content"],
+                            memory_status=memory_status,
+                            memory_type=memory.get("memory_type"),
+                        )
+                    except Exception as exc:
+                        sync_errors.append(
+                            {
+                                "memory_id": real_id,
+                                "error": f"index_sync_failed:{exc}",
+                            }
+                        )
+                        self.active_memory_cache.mark_dirty(real_id)
+                    continue
+
+                real_memory_id = int(memory_id)
+                if memory.get("memory_status") == "discard":
+                    reviewed = self.memory_store.update_memory_review(
+                        real_memory_id,
+                        confidence,
+                        "discard",
+                    )
+                    if not reviewed:
+                        sync_errors.append(
+                            {
+                                "memory_id": real_memory_id,
+                                "error": "memory_review_update_failed",
+                            }
+                        )
+                        continue
+                    try:
+                        self.semantic_retriever.delete_memory(real_memory_id)
+                    except Exception as exc:
+                        sync_errors.append(
+                            {
+                                "memory_id": real_memory_id,
+                                "error": f"index_sync_failed:{exc}",
+                            }
+                        )
+                        continue
+                    self.active_memory_cache.remove_memory(real_memory_id)
+                    discarded_memory_ids.append(real_memory_id)
+                    reviewed_memories.append(
+                        {
+                            "memory_id": real_memory_id,
+                            "reviewed": True,
+                            "confidence": confidence,
+                            "memory_status": "discard",
+                        }
+                    )
+                    continue
+
+                reviewed = self.memory_store.update_memory_review(
+                    real_memory_id,
+                    confidence,
+                    memory_status,
+                )
+                if not reviewed:
+                    sync_errors.append(
+                        {
+                            "memory_id": real_memory_id,
+                            "error": "memory_review_update_failed",
+                        }
+                    )
+                    continue
+                record = self.memory_store.get_memory_record(real_memory_id)
+                if record:
+                    try:
+                        self.semantic_retriever.add_memory(
+                            memory_id=real_memory_id,
+                            user_id=record["user_id"],
+                            content=record["content"],
+                            memory_status=record["memory_status"],
+                            memory_type=record.get("memory_type"),
+                        )
+                    except Exception as exc:
+                        sync_errors.append(
+                            {
+                                "memory_id": real_memory_id,
+                                "error": f"index_sync_failed:{exc}",
+                            }
+                        )
+                        continue
+                    self.active_memory_cache.upsert_memory(record, dirty=False)
+                reviewed_memories.append(
+                    {
+                        "memory_id": real_memory_id,
+                        "reviewed": True,
+                        "confidence": confidence,
+                        "memory_status": memory_status,
+                    }
+                )
+            except Exception as exc:
+                sync_errors.append(
+                    {
+                        "memory_id": memory_id,
+                        "error": f"memory_sync_failed:{exc}",
+                    }
+                )
+        return {
+            "dirty_memories": dirty_memories,
+            "saved_memory_ids": saved_memory_ids,
+            "reviewed_memories": reviewed_memories,
+            "discarded_memory_ids": discarded_memory_ids,
+            "sync_errors": sync_errors,
+            "active_memory_cache": self.active_memory_cache.to_dict(),
+        }
+
+    def _get_cached_memory(self, memory_id: int) -> dict[str, Any] | None:
+        for memory in self.active_memory_cache.memories:
+            if memory.get("id") == memory_id:
+                return dict(memory)
+        return None
+
+    def _merge_error(self, current_error: str | None, new_error: str) -> str:
+        if not current_error:
+            return new_error
+        if new_error in current_error:
+            return current_error
+        return f"{current_error}; {new_error}"
 
     def _load_session_state(self, state: AgentState) -> dict[str, Any] | None:
         me_id = state.get("me_id") or "default"
@@ -590,6 +800,34 @@ class GraphMemoryAgent:
             "dirty_memories": [],
             "saved_memory_ids": [],
             "reviewed_memories": [],
+            "discarded_memory_ids": [],
+            "sync_errors": [],
+            "context_switch_sync_result": None,
             "status": "started",
             "error": None,
+        }
+
+    def _public_result(self, state: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "status": state.get("status"),
+            "intent": state.get("intent"),
+            "input_summary": state.get("input_summary"),
+            "active_user_id": state.get("active_user_id"),
+            "reply": state.get("reply"),
+            "working_memory": state.get("working_memory", []),
+            "retrieval_query": state.get("retrieval_query"),
+            "query_similarity": state.get("query_similarity"),
+            "reuse_cache": state.get("reuse_cache"),
+            "saved_memory_ids": state.get("saved_memory_ids", []),
+            "reviewed_memories": state.get("reviewed_memories", []),
+            "discarded_memory_ids": state.get("discarded_memory_ids", []),
+            "session_state_saved": state.get("session_state_saved"),
+            "error": state.get("error"),
+            "debug": {
+                "semantic_results": state.get("semantic_results", []),
+                "relevant_memories": state.get("relevant_memories", []),
+                "dirty_memories": state.get("dirty_memories", []),
+                "sync_errors": state.get("sync_errors", []),
+                "context_switch_sync_result": state.get("context_switch_sync_result"),
+            },
         }

@@ -1,3 +1,7 @@
+# LEGACY MODULE
+# DifyClient is kept only for the old sequential MemoryAgent.
+# New GraphMemoryAgent must use llm_client.py instead.
+
 from __future__ import annotations
 
 import json

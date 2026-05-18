@@ -44,6 +44,9 @@ class AgentState(TypedDict, total=False):
     dirty_memories: list[dict[str, Any]]
     saved_memory_ids: list[int]
     reviewed_memories: list[dict[str, Any]]
+    discarded_memory_ids: list[int]
+    sync_errors: list[dict[str, Any]]
+    context_switch_sync_result: dict[str, Any] | None
 
     status: str
     error: str | None

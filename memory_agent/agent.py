@@ -1,3 +1,8 @@
+# LEGACY MODULE
+# This old sequential MemoryAgent depends on DifyClient.
+# Do not use this module in the new LangGraph pipeline.
+# Use GraphMemoryAgent from graph_agent.py instead.
+
 from __future__ import annotations
 
 from typing import Any
@@ -45,6 +50,8 @@ def build_dify_inputs(
 
 class MemoryAgent:
     """Agent workflow coordinator.
+
+    Legacy Dify-based agent. Kept only for backward compatibility.
 
     Python does not do emotion analysis, reply generation, or working-memory
     summarization. It only coordinates filtering, storage, state rules, semantic

@@ -48,10 +48,16 @@ class MemoryStore:
                         content TEXT NOT NULL,
                         confidence REAL DEFAULT 0.8,
                         memory_status TEXT DEFAULT 'stable',
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        source_type TEXT,
+                        source_summary TEXT,
+                        last_evidence TEXT
                     )
                     """
                 )
+                # Legacy summary-style working memory table.
+                # New GraphMemoryAgent uses working_memory_observations instead.
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS working_memory (
@@ -60,6 +66,34 @@ class MemoryStore:
                         confidence REAL DEFAULT 0.8,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
+                    """
+                )
+        self.ensure_schema_migrations()
+
+    def ensure_schema_migrations(self) -> None:
+        """Add columns introduced after the first local schema version."""
+        required_columns = {
+            "updated_at": "TIMESTAMP",
+            "source_type": "TEXT",
+            "source_summary": "TEXT",
+            "last_evidence": "TEXT",
+        }
+        with closing(self._connect()) as conn:
+            with conn:
+                existing_columns = {
+                    row["name"]
+                    for row in conn.execute("PRAGMA table_info(user_memory)").fetchall()
+                }
+                for column_name, column_type in required_columns.items():
+                    if column_name not in existing_columns:
+                        conn.execute(
+                            f"ALTER TABLE user_memory ADD COLUMN {column_name} {column_type}"
+                        )
+                conn.execute(
+                    """
+                    UPDATE user_memory
+                    SET updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)
+                    WHERE updated_at IS NULL
                     """
                 )
                 conn.execute(
@@ -114,7 +148,9 @@ class MemoryStore:
             with conn:
                 row = conn.execute(
                     """
-                    SELECT id, user_id, memory_type, content, confidence, memory_status, created_at
+                    SELECT id, user_id, memory_type, content, confidence,
+                           memory_status, created_at, updated_at, source_type,
+                           source_summary, last_evidence
                     FROM user_memory
                     WHERE id = ?
                     """,
@@ -138,7 +174,9 @@ class MemoryStore:
             with conn:
                 rows = conn.execute(
                     f"""
-                    SELECT id, user_id, memory_type, content, confidence, memory_status, created_at
+                    SELECT id, user_id, memory_type, content, confidence,
+                           memory_status, created_at, updated_at, source_type,
+                           source_summary, last_evidence
                     FROM user_memory
                     WHERE id IN ({placeholders})
                     """,
@@ -155,6 +193,9 @@ class MemoryStore:
         content: str,
         confidence: float = 0.8,
         memory_status: str = "stable",
+        source_type: str | None = None,
+        source_summary: str | None = None,
+        last_evidence: str | None = None,
     ) -> int:
         """Insert one long-term memory row and return its SQLite id."""
         content = content.strip()
@@ -169,11 +210,24 @@ class MemoryStore:
                         memory_type,
                         content,
                         confidence,
-                        memory_status
+                        memory_status,
+                        updated_at,
+                        source_type,
+                        source_summary,
+                        last_evidence
                     )
-                    VALUES (?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
                     """,
-                    (user_id, memory_type, content, confidence, memory_status),
+                    (
+                        user_id,
+                        memory_type,
+                        content,
+                        confidence,
+                        memory_status,
+                        source_type,
+                        source_summary,
+                        last_evidence,
+                    ),
                 )
                 return int(cursor.lastrowid)
 
@@ -186,7 +240,8 @@ class MemoryStore:
                 cursor = conn.execute(
                     """
                     UPDATE user_memory
-                    SET memory_status = ?
+                    SET memory_status = ?,
+                        updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
                     (new_status, memory_id),
@@ -208,7 +263,8 @@ class MemoryStore:
                     """
                     UPDATE user_memory
                     SET confidence = ?,
-                        memory_status = ?
+                        memory_status = ?,
+                        updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
                     (new_confidence, new_status, memory_id),
@@ -218,11 +274,34 @@ class MemoryStore:
             return None
         return new_status
 
-    def get_working_memory(self, user_id: str) -> dict[str, Any] | None:
-        """Return the user's current working memory, or None if missing.
+    def update_memory_review(
+        self,
+        memory_id: int,
+        confidence: float,
+        memory_status: str,
+    ) -> bool:
+        """Update confidence/status for a reviewed memory using an explicit status."""
+        self._validate_memory_status(memory_status)
 
-        Python only stores and retrieves this value. The model is responsible for
-        deciding what the working memory content should be.
+        with closing(self._connect()) as conn:
+            with conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE user_memory
+                    SET confidence = ?,
+                        memory_status = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (confidence, memory_status, memory_id),
+                )
+                return cursor.rowcount > 0
+
+    def get_working_memory(self, user_id: str) -> dict[str, Any] | None:
+        """Legacy summary-style working memory getter.
+
+        New GraphMemoryAgent should use get_working_memory_observations().
+        Kept for old MemoryAgent compatibility.
         """
         with closing(self._connect()) as conn:
             with conn:
@@ -242,10 +321,10 @@ class MemoryStore:
         content: str,
         confidence: float = 0.8,
     ) -> None:
-        """Replace the user's working memory with the model's latest summary.
+        """Legacy summary-style working memory upsert.
 
-        This is an upsert: it inserts the row when missing and overwrites content,
-        confidence, and updated_at when the user already has working memory.
+        New GraphMemoryAgent should use update_working_memory_observations().
+        Kept for old MemoryAgent compatibility.
         """
         content = content.strip()
         if not user_id:
@@ -471,7 +550,9 @@ class MemoryStore:
             with conn:
                 rows = conn.execute(
                     """
-                    SELECT id, user_id, memory_type, content, confidence, memory_status, created_at
+                    SELECT id, user_id, memory_type, content, confidence,
+                           memory_status, created_at, updated_at, source_type,
+                           source_summary, last_evidence
                     FROM user_memory
                     WHERE user_id = ?
                       AND memory_status = ?
@@ -597,6 +678,9 @@ def save_memory(
     content: str,
     confidence: float = 0.8,
     memory_status: str = "stable",
+    source_type: str | None = None,
+    source_summary: str | None = None,
+    last_evidence: str | None = None,
     db_path: str | Path = "memory.db",
 ) -> int:
     return MemoryStore(db_path).save_memory(
@@ -605,6 +689,9 @@ def save_memory(
         content,
         confidence,
         memory_status,
+        source_type,
+        source_summary,
+        last_evidence,
     )
 
 
@@ -626,4 +713,17 @@ def review_memory_status(
         memory_id,
         new_confidence,
         has_conflict,
+    )
+
+
+def update_memory_review(
+    memory_id: int,
+    confidence: float,
+    memory_status: str,
+    db_path: str | Path = "memory.db",
+) -> bool:
+    return MemoryStore(db_path).update_memory_review(
+        memory_id,
+        confidence,
+        memory_status,
     )
