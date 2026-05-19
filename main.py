@@ -9,7 +9,9 @@ from memory_agent.graph_agent import GraphMemoryAgent
 from memory_agent.llm_client import LLMClient
 from memory_agent.memory_store import MemoryStore
 from memory_agent.semantic_retriever import SemanticRetriever
+from dotenv import load_dotenv
 
+load_dotenv()
 
 def main() -> int:
     if len(sys.argv) != 2:

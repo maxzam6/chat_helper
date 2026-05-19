@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from typing import Any
-
+import os
+import json
+from .models import parse_llm_json
+from openai import OpenAI
 
 class BaseLLMClient(ABC):
     """Generic model client interface used by GraphMemoryAgent."""
@@ -28,17 +31,20 @@ class MockLLMClient(BaseLLMClient):
             return self._learning(inputs)
         return {}
 
-    def _intent_classifier(self, inputs: dict[str, Any]) -> dict[str, str]:
+    def _intent_classifier(self, inputs: dict[str, Any]) -> dict[str, Any]:
         user_input = str(inputs.get("user_input", ""))
+        intents: list[str] = []
+        if any(token in user_input for token in ("是什么", "为什么", "怎么做", "LangGraph", "解释")):
+            intents.append("general_question")
         if any(token in user_input for token in ("短一点", "自然一点", "太油腻", "不要这么", "改一下", "换个说法")):
-            intent = "revise_reply"
-        elif any(token in user_input for token in ("记一下", "画像", "其实她", "其实他", "她不是", "他不是", "不喜欢", "喜欢", "平时")):
-            intent = "profile_update"
-        elif any(token in user_input for token in ("怎么回", "回复", "她说", "他说", "聊天", "帮我看看", "该不该")):
-            intent = "reply_advice"
-        else:
-            intent = "general_question"
-        return {"intent": intent, "input_summary": user_input}
+            intents.append("revise_reply")
+        if any(token in user_input for token in ("怎么回", "回复", "她说", "他说", "聊天", "帮我看看", "该不该")):
+            intents.append("reply_advice")
+        if any(token in user_input for token in ("记一下", "画像", "其实她", "其实他", "她不是", "他不是", "不喜欢", "喜欢", "平时")):
+            intents.append("profile_update")
+        if not intents:
+            intents.append("general_question")
+        return {"intent": intents[0], "intents": intents, "input_summary": user_input}
 
     def _reply(self, inputs: dict[str, Any]) -> dict[str, Any]:
         intent = inputs.get("intent")
@@ -109,6 +115,60 @@ class MockLLMClient(BaseLLMClient):
             "changed_summary": "Memory profile updated from latest context.",
         }
 
+class LLMClient(BaseLLMClient):
 
+    def __init__(self):
+
+        self.client = OpenAI(
+            api_key=os.getenv("LLM_API_KEY"),
+            base_url=os.getenv("LLM_BASE_URL"),
+        )
+
+        self.model = os.getenv("LLM_MODEL")
+
+    def _load_prompt(self, task: str) -> str:
+
+        prompt_path = os.path.join(
+            os.path.dirname(__file__),
+            "prompts",
+            f"{task}.md"
+        )
+
+        with open(prompt_path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def generate_json(
+        self,
+        task: str,
+        inputs: dict,
+    ) -> dict:
+
+        system_prompt = self._load_prompt(task)
+
+        user_content = json.dumps(
+            inputs,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": user_content,
+                },
+            ],
+            temperature=0.7,
+        )
+
+        text = response.choices[0].message.content
+
+        return parse_llm_json(text)
+    
 class LLMClient(MockLLMClient):
     """Default local client; replace with a real provider later."""
