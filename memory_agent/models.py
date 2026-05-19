@@ -30,15 +30,23 @@ def parse_llm_json(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def extract_intent_result(output: dict[str, Any]) -> dict[str, str]:
+def extract_intent_result(output: dict[str, Any]) -> dict[str, Any]:
     result = _extract_dict_field(output, "intent_result")
     if not result:
         result = {
             "intent": _extract_string_field(output, "intent"),
+            "intents": _extract_list_field(output, "intents"),
             "input_summary": _extract_string_field(output, "input_summary"),
         }
+    intent = result.get("intent") or "general_question"
+    raw_intents = result.get("intents")
+    intents = raw_intents if isinstance(raw_intents, list) else []
+    intents = [str(item) for item in intents if isinstance(item, str) and item.strip()]
+    if not intents:
+        intents = [intent]
     return {
-        "intent": result.get("intent") or "general_question",
+        "intent": intent,
+        "intents": intents,
         "input_summary": result.get("input_summary") or "",
     }
 

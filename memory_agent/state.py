@@ -14,6 +14,10 @@ class AgentState(TypedDict, total=False):
     user_input: str
     intent: Intent
     input_summary: str
+    task_list: list[str]
+    current_task: str | None
+    completed_tasks: list[str]
+    task_results: list[dict[str, Any]]
 
     reply: dict[str, Any]
     last_reply: dict[str, Any] | None

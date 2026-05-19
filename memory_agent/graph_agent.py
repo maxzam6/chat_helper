@@ -69,7 +69,8 @@ from .semantic_retriever import SemanticRetriever
 from .state import AgentState
 
 
-ALLOWED_INTENTS = {"general_question", "revise_reply", "reply_advice", "profile_update"}
+TASK_PRIORITY = ["general_question", "revise_reply", "reply_advice", "profile_update"]
+ALLOWED_INTENTS = set(TASK_PRIORITY)
 
 
 class GraphMemoryAgent:
@@ -93,6 +94,7 @@ class GraphMemoryAgent:
     def build_graph(self) -> StateGraph:
         graph = StateGraph(AgentState)
         graph.add_node("classify_intent", self.classify_intent)
+        graph.add_node("select_next_task", self.select_next_task)
         graph.add_node("reply_general", self.reply_general)
         graph.add_node("load_session_state", self.load_session_state)
         graph.add_node("check_last_reply", self.check_last_reply)
@@ -116,16 +118,19 @@ class GraphMemoryAgent:
         graph.add_node("sync_dirty_memory", self.sync_dirty_memory)
         graph.add_node("profile_update_confirm_reply", self.profile_update_confirm_reply)
         graph.add_node("save_session_state", self.save_session_state)
+        graph.add_node("mark_task_done", self.mark_task_done)
 
         graph.add_edge(START, "classify_intent")
+        graph.add_edge("classify_intent", "select_next_task")
         graph.add_conditional_edges(
-            "classify_intent",
+            "select_next_task",
             self.route_by_intent,
             {
                 "general_question": "reply_general",
                 "revise_reply": "load_session_state",
                 "reply_advice": "check_user_context",
                 "profile_update": "check_user_context",
+                "done": END,
             },
         )
         graph.add_edge("reply_general", "save_session_state")
@@ -178,7 +183,8 @@ class GraphMemoryAgent:
             {"reply_advice": "save_session_state", "profile_update": "profile_update_confirm_reply"},
         )
         graph.add_edge("profile_update_confirm_reply", "save_session_state")
-        graph.add_edge("save_session_state", END)
+        graph.add_edge("save_session_state", "mark_task_done")
+        graph.add_edge("mark_task_done", "select_next_task")
         return graph
 
     def process(self, payload: dict[str, Any], return_full_state: bool = False) -> dict[str, Any]:
@@ -198,14 +204,45 @@ class GraphMemoryAgent:
             },
         )
         result = extract_intent_result(output)
-        intent = result.get("intent") or "general_question"
-        if intent not in ALLOWED_INTENTS:
-            intent = "general_question"
+        task_list = self._normalize_task_list(result.get("intents") or [result.get("intent")])
+        intent = task_list[0]
         return {
             "intent": intent,
+            "current_task": None,
+            "task_list": task_list,
+            "completed_tasks": [],
+            "task_results": [],
             "input_summary": result.get("input_summary") or state.get("user_input", ""),
             "status": "intent_classified",
         }
+
+    def select_next_task(self, state: AgentState) -> dict[str, Any]:
+        completed_tasks = set(state.get("completed_tasks", []))
+        for task in state.get("task_list", []):
+            if task in completed_tasks:
+                continue
+            return {
+                "intent": task,
+                "current_task": task,
+                "status": "task_selected",
+                "reply": {},
+                "retrieval_query": "",
+                "query_similarity": 0.0,
+                "reuse_cache": False,
+                "semantic_results": [],
+                "relevant_memories": [],
+                "memory_updates": [],
+                "memory_reviews": [],
+                "changed_summary": None,
+                "dirty_memories": [],
+                "saved_memory_ids": [],
+                "reviewed_memories": [],
+                "discarded_memory_ids": [],
+                "sync_errors": [],
+                "session_state_saved": None,
+                "error": None,
+            }
+        return {}
 
     def reply_general(self, state: AgentState) -> dict[str, Any]:
         session_state = self.memory_store.get_session_state(state.get("me_id") or "default", "global")
@@ -551,7 +588,35 @@ class GraphMemoryAgent:
     def noop(self, state: AgentState) -> dict[str, Any]:
         return {}
 
+    def mark_task_done(self, state: AgentState) -> dict[str, Any]:
+        current_task = state.get("current_task") or state.get("intent")
+        if not current_task:
+            return {}
+        completed_tasks = list(state.get("completed_tasks", []))
+        if current_task not in completed_tasks:
+            completed_tasks.append(current_task)
+
+        task_results = list(state.get("task_results", []))
+        task_results.append(
+            {
+                "task": current_task,
+                "status": state.get("status"),
+                "reply": state.get("reply"),
+                "saved_memory_ids": state.get("saved_memory_ids", []),
+                "reviewed_memories": state.get("reviewed_memories", []),
+                "discarded_memory_ids": state.get("discarded_memory_ids", []),
+                "session_state_saved": state.get("session_state_saved"),
+                "error": state.get("error"),
+            }
+        )
+        return {
+            "completed_tasks": completed_tasks,
+            "task_results": task_results,
+        }
+
     def route_by_intent(self, state: AgentState) -> str:
+        if len(state.get("completed_tasks", [])) >= len(state.get("task_list", [])):
+            return "done"
         intent = state.get("intent") or "general_question"
         return intent if intent in ALLOWED_INTENTS else "general_question"
 
@@ -787,6 +852,10 @@ class GraphMemoryAgent:
             "current_user_id": payload.get("current_user_id"),
             "active_user_id": payload.get("current_user_id"),
             "user_input": payload.get("user_input", ""),
+            "task_list": [],
+            "current_task": None,
+            "completed_tasks": [],
+            "task_results": [],
             "chat_context": chat_context,
             "chat_text": messages_to_chat_text(chat_context.get("recent_messages", [])),
             "screenshot_path": payload.get("screenshot_path"),
@@ -807,10 +876,26 @@ class GraphMemoryAgent:
             "error": None,
         }
 
+    def _normalize_task_list(self, raw_intents: Any) -> list[str]:
+        if not isinstance(raw_intents, list):
+            raw_intents = [raw_intents]
+        seen: set[str] = set()
+        allowed = {intent for intent in raw_intents if isinstance(intent, str) and intent in ALLOWED_INTENTS}
+        ordered: list[str] = []
+        for intent in TASK_PRIORITY:
+            if intent in allowed and intent not in seen:
+                ordered.append(intent)
+                seen.add(intent)
+        return ordered or ["general_question"]
+
     def _public_result(self, state: dict[str, Any]) -> dict[str, Any]:
         return {
             "status": state.get("status"),
             "intent": state.get("intent"),
+            "task_list": state.get("task_list", []),
+            "current_task": state.get("current_task"),
+            "completed_tasks": state.get("completed_tasks", []),
+            "task_results": state.get("task_results", []),
             "input_summary": state.get("input_summary"),
             "active_user_id": state.get("active_user_id"),
             "reply": state.get("reply"),

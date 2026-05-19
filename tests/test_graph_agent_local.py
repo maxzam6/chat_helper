@@ -134,6 +134,9 @@ class GraphMemoryAgentLocalTest(unittest.TestCase):
             )
 
             self.assertEqual(result["intent"], "general_question")
+            self.assertEqual(result["task_list"], ["general_question"])
+            self.assertEqual(result["completed_tasks"], ["general_question"])
+            self.assertEqual([item["task"] for item in result["task_results"]], ["general_question"])
             self.assertIn("debug", result)
             self.assertNotIn("memory_updates", result)
             self.assertTrue(result["session_state_saved"])
@@ -475,6 +478,39 @@ class GraphMemoryAgentLocalTest(unittest.TestCase):
             self.assertTrue(sync_result["sync_errors"])
             self.assertTrue(agent.active_memory_cache.dirty_memory_ids)
             self.assertEqual(store.get_user_memory("A001"), ["needs retry"])
+
+    def test_multiple_intents_run_in_priority_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            llm = RecordingLLMClient()
+            agent, _ = make_agent(store, llm)
+
+            result = agent.process(
+                {
+                    "me_id": "default",
+                    "current_user_id": "A001",
+                    "user_input": (
+                        "LangGraph \u662f\u4ec0\u4e48\uff1f"
+                        "\u5979\u56de\u6211\u54e6\uff0c\u6211\u8be5\u600e\u4e48\u56de\uff1f"
+                        "\u8bb0\u4e00\u4e0b\uff0c\u5979\u5e73\u65f6\u8bdd\u5c11\uff0c\u4e0d\u662f\u51b7\u6de1"
+                    ),
+                    "chat_context": make_chat_context(),
+                },
+                return_full_state=True,
+            )
+
+            expected_tasks = ["general_question", "reply_advice", "profile_update"]
+            self.assertEqual(result["task_list"], expected_tasks)
+            self.assertEqual(result["completed_tasks"], expected_tasks)
+            self.assertEqual([item["task"] for item in result["task_results"]], expected_tasks)
+            self.assertEqual(result["intent"], "profile_update")
+            self.assertEqual(llm.tasks.count("intent_classifier"), 1)
+            self.assertEqual(llm.tasks.count("ocr"), 1)
+            self.assertEqual(llm.tasks.count("retrieval_query"), 2)
+            self.assertEqual(llm.tasks.count("learning"), 2)
+            self.assertGreaterEqual(llm.tasks.count("reply"), 3)
+            self.assertTrue(result["saved_memory_ids"])
+            self.assertGreaterEqual(len(store.get_user_memory("A001")), 2)
 
 
 if __name__ == "__main__":
