@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from typing import Any
-
+import os
+import json
+from .models import parse_llm_json
+from openai import OpenAI
 
 class BaseLLMClient(ABC):
     """Generic model client interface used by GraphMemoryAgent."""
@@ -112,6 +115,60 @@ class MockLLMClient(BaseLLMClient):
             "changed_summary": "Memory profile updated from latest context.",
         }
 
+class LLMClient(BaseLLMClient):
 
+    def __init__(self):
+
+        self.client = OpenAI(
+            api_key=os.getenv("LLM_API_KEY"),
+            base_url=os.getenv("LLM_BASE_URL"),
+        )
+
+        self.model = os.getenv("LLM_MODEL")
+
+    def _load_prompt(self, task: str) -> str:
+
+        prompt_path = os.path.join(
+            os.path.dirname(__file__),
+            "prompts",
+            f"{task}.md"
+        )
+
+        with open(prompt_path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def generate_json(
+        self,
+        task: str,
+        inputs: dict,
+    ) -> dict:
+
+        system_prompt = self._load_prompt(task)
+
+        user_content = json.dumps(
+            inputs,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": user_content,
+                },
+            ],
+            temperature=0.7,
+        )
+
+        text = response.choices[0].message.content
+
+        return parse_llm_json(text)
+    
 class LLMClient(MockLLMClient):
     """Default local client; replace with a real provider later."""

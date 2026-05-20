@@ -3,3 +3,8 @@
 chromadb
 langgraph
 sentence-transformers
+openai
+python-dotenv
+langchain
+langchain-openai
+numpy

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 
@@ -178,3 +179,34 @@ def _strip_markdown_json_block(text: str) -> str:
             lines = lines[:-1]
         cleaned = "\n".join(lines).strip()
     return cleaned
+
+
+
+
+def parse_llm_json(text: str) -> dict:
+
+    if not text:
+        return {}
+
+    text = text.strip()
+
+    # 去 markdown code block
+    text = re.sub(r"^```json", "", text)
+    text = re.sub(r"^```", "", text)
+    text = re.sub(r"```$", "", text)
+
+    text = text.strip()
+
+    # 提取最外层 JSON
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+
+    if not match:
+        return {}
+
+    json_text = match.group(0)
+
+    try:
+        return json.loads(json_text)
+
+    except Exception:
+        return {}
