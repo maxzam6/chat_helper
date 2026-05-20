@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
-import os
 import json
-from .models import parse_llm_json
+import os
+from pathlib import Path
+from typing import Any
+
 from openai import OpenAI
+
+from .models import parse_llm_json
+
 
 class BaseLLMClient(ABC):
     """Generic model client interface used by GraphMemoryAgent."""
@@ -16,7 +20,7 @@ class BaseLLMClient(ABC):
 
 
 class MockLLMClient(BaseLLMClient):
-    """Local deterministic model mock for development and tests."""
+    """Local deterministic model mock for tests only."""
 
     def generate_json(self, task: str, inputs: dict[str, Any]) -> dict[str, Any]:
         if task == "intent_classifier":
@@ -115,60 +119,64 @@ class MockLLMClient(BaseLLMClient):
             "changed_summary": "Memory profile updated from latest context.",
         }
 
+
 class LLMClient(BaseLLMClient):
+    """OpenAI-compatible JSON model client for the main GraphMemoryAgent path."""
 
-    def __init__(self):
-
-        self.client = OpenAI(
-            api_key=os.getenv("LLM_API_KEY"),
-            base_url=os.getenv("LLM_BASE_URL"),
+    def __init__(
+        self,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        model: str | None = None,
+        temperature: float | None = None,
+        response_format: str | None = None,
+    ) -> None:
+        self.api_key = api_key or os.getenv("LLM_API_KEY")
+        self.base_url = base_url or os.getenv("LLM_BASE_URL") or None
+        self.model = model or os.getenv("LLM_MODEL")
+        self.temperature = (
+            temperature
+            if temperature is not None
+            else float(os.getenv("LLM_TEMPERATURE", "0.2"))
+        )
+        self.response_format = (
+            response_format
+            if response_format is not None
+            else os.getenv("LLM_RESPONSE_FORMAT", "json_object")
         )
 
-        self.model = os.getenv("LLM_MODEL")
+        if not self.api_key:
+            raise RuntimeError("LLM_API_KEY is required when using the real LLMClient.")
+        if not self.model:
+            raise RuntimeError("LLM_MODEL is required when using the real LLMClient.")
+
+        self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+
+    def generate_json(self, task: str, inputs: dict[str, Any]) -> dict[str, Any]:
+        system_prompt = self._load_prompt(task)
+        user_content = json.dumps(inputs, ensure_ascii=False, indent=2)
+
+        request_kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            "temperature": self.temperature,
+        }
+        if self.response_format and self.response_format.lower() != "none":
+            request_kwargs["response_format"] = {"type": self.response_format}
+
+        response = self.client.chat.completions.create(**request_kwargs)
+        text = response.choices[0].message.content or ""
+        return parse_llm_json(text)
 
     def _load_prompt(self, task: str) -> str:
+        prompt_path = Path(__file__).resolve().parent / "prompts" / f"{task}.md"
+        if not prompt_path.exists():
+            raise FileNotFoundError(f"Prompt file not found for task: {task}")
 
-        prompt_path = os.path.join(
-            os.path.dirname(__file__),
-            "prompts",
-            f"{task}.md"
-        )
-
-        with open(prompt_path, "r", encoding="utf-8") as f:
-            return f.read()
-
-    def generate_json(
-        self,
-        task: str,
-        inputs: dict,
-    ) -> dict:
-
-        system_prompt = self._load_prompt(task)
-
-        user_content = json.dumps(
-            inputs,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": user_content,
-                },
-            ],
-            temperature=0.7,
-        )
-
-        text = response.choices[0].message.content
-
-        return parse_llm_json(text)
-    
-class LLMClient(MockLLMClient):
-    """Default local client; replace with a real provider later."""
+        prompt = prompt_path.read_text(encoding="utf-8").strip()
+        if not prompt:
+            raise ValueError(f"Prompt file is empty for task: {task}")
+        return prompt

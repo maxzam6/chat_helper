@@ -51,6 +51,8 @@ class AgentState(TypedDict, total=False):
     discarded_memory_ids: list[int]
     sync_errors: list[dict[str, Any]]
     context_switch_sync_result: dict[str, Any] | None
+    session_state_saved: bool | None
+    reason: str | None
 
     status: str
     error: str | None

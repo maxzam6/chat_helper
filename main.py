@@ -24,6 +24,18 @@ def main() -> int:
     memory_store = MemoryStore(os.getenv("MEMORY_DB_PATH", "memory.db"))
     semantic_retriever = SemanticRetriever(
         persist_path=os.getenv("CHROMA_DB_PATH", "chroma_memory"),
+        collection_name=os.getenv(
+            "CHROMA_COLLECTION_NAME",
+            SemanticRetriever.DEFAULT_COLLECTION_NAME,
+        ),
+        model_name=os.getenv(
+            "EMBEDDING_MODEL_NAME",
+            SemanticRetriever.DEFAULT_MODEL_NAME,
+        ),
+        query_instruction=os.getenv(
+            "EMBEDDING_QUERY_INSTRUCTION",
+            SemanticRetriever.DEFAULT_QUERY_INSTRUCTION,
+        ),
     )
     agent = GraphMemoryAgent(
         memory_store=memory_store,

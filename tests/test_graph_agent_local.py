@@ -337,6 +337,47 @@ class GraphMemoryAgentLocalTest(unittest.TestCase):
             self.assertFalse(any(str(memory_id).startswith("tmp_") for memory_id in cache_ids))
             self.assertEqual(agent.active_memory_cache.dirty_memory_ids, set())
 
+    def test_duplicate_memory_update_reuses_existing_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            store.init_db()
+            existing_id = store.save_memory(
+                "A001",
+                "conversation_style",
+                "prefers concise replies",
+                0.82,
+                "stable",
+            )
+            llm = RecordingLLMClient()
+            agent, _ = make_agent(store, llm)
+            agent.active_memory_cache.set_cache("A001", "short replies", [])
+            agent.update_cache_from_learning(
+                {
+                    "active_user_id": "A001",
+                    "current_user_id": "A001",
+                    "memory_updates": [
+                        {
+                            "memory_type": "conversation_style",
+                            "content": "prefers concise replies",
+                            "confidence": 0.82,
+                            "has_conflict": False,
+                        }
+                    ],
+                    "memory_reviews": [],
+                }
+            )
+
+            sync_result = agent.sync_dirty_memory({})
+
+            self.assertEqual(sync_result["saved_memory_ids"], [])
+            self.assertEqual(store.get_user_memory("A001"), ["prefers concise replies"])
+            self.assertEqual(
+                len(store.get_memory_records([existing_id])),
+                1,
+            )
+            self.assertEqual(agent.active_memory_cache.get_memories()[0]["id"], existing_id)
+            self.assertTrue(sync_result["reviewed_memories"][0]["duplicate"])
+
     def test_memory_review_updates_cache_then_syncs_sqlite(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(Path(tmp) / "memory.db")

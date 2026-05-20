@@ -15,7 +15,7 @@ chat input
 -> session_state + working_memory_observations
 ```
 
-The main chain does not depend on any fixed model platform. `LLMClient` is a thin abstraction that can later be connected to OpenAI, local models, Ollama, Tongyi, or other providers. `MockLLMClient` keeps the local loop runnable without real keys.
+The main chain does not depend on any fixed model platform. `LLMClient` is an OpenAI-compatible JSON client for the runtime path. `MockLLMClient` is kept for tests and explicit local doubles only.
 
 ## Project Structure
 
@@ -45,7 +45,25 @@ main.py
 ```text
 MEMORY_DB_PATH=memory.db
 CHROMA_DB_PATH=chroma_memory
+CHROMA_COLLECTION_NAME=user_memory_bge_base_zh_v15
+EMBEDDING_MODEL_NAME=BAAI/bge-base-zh-v1.5
+EMBEDDING_QUERY_INSTRUCTION=为这个句子生成表示以用于检索相关文章：
+LLM_API_KEY=your_api_key_here
+LLM_BASE_URL=https://api.deepseek.com/v1
+LLM_MODEL=deepseek-chat
+LLM_TEMPERATURE=0.2
+LLM_RESPONSE_FORMAT=json_object
 ```
+
+## Semantic Retrieval
+
+`SemanticRetriever` uses `BAAI/bge-base-zh-v1.5` by default for Chinese memory
+retrieval. Query text is embedded with the BGE query instruction configured by
+`EMBEDDING_QUERY_INSTRUCTION`; stored memory content is embedded as-is.
+
+SQLite remains the source of truth. ChromaDB is only the recall index. The
+default collection name is model-specific (`user_memory_bge_base_zh_v15`) to
+avoid mixing vectors from different embedding dimensions in one collection.
 
 ## Run
 

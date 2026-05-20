@@ -1,0 +1,18 @@
+{
+  "me_id": "default",
+  "current_user_id": "A001",
+  "user_input": "她又只回我嗯，我现在该怎么回？",
+  "chat_context": {
+    "recent_messages": [
+      {
+        "role": "user",
+        "content": "嗯"
+      },
+      {
+        "role": "me",
+        "content": "你是不是又不想理我了？"
+      }
+    ],
+    "previous_recent_messages": []
+  }
+}

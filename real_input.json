@@ -1,0 +1,35 @@
+{
+  "me_id": "default",
+  "current_user_id": "A001",
+  "user_input": "她最近连续几次都只回我哦、嗯，我一追问她就更冷淡。她以前说过不喜欢别人一直逼问她，但我容易着急。帮我看看现在该怎么回，也顺便记一下：她不喜欢高频连续追问，平时压力大时会短回复。",
+  "chat_context": {
+    "recent_messages": [
+      {
+        "role": "user",
+        "content": "今天有点累，先不聊太多"
+      },
+      {
+        "role": "me",
+        "content": "你是不是不想理我了？"
+      },
+      {
+        "role": "user",
+        "content": "没有，就是累"
+      },
+      {
+        "role": "me",
+        "content": "那你怎么每次都这么冷淡"
+      },
+      {
+        "role": "user",
+        "content": "嗯"
+      }
+    ],
+    "previous_recent_messages": [
+      {
+        "role": "user",
+        "content": "今天有点累，先不聊太多"
+      }
+    ]
+  }
+}

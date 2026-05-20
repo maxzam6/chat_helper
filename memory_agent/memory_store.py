@@ -231,6 +231,46 @@ class MemoryStore:
                 )
                 return int(cursor.lastrowid)
 
+    def find_duplicate_memory(
+        self,
+        user_id: str,
+        memory_type: str | None,
+        content: str,
+        statuses: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Return an existing active memory with the same user/type/content.
+
+        This is an exact duplicate guard. It intentionally does not try semantic
+        merging; near-duplicate consolidation should be handled by a later review
+        or merge flow.
+        """
+        content = content.strip()
+        if not user_id or not content:
+            return None
+        statuses = statuses or ["stable", "pending", "conflict"]
+        for status in statuses:
+            self._validate_memory_status(status)
+
+        placeholders = ", ".join("?" for _ in statuses)
+        with closing(self._connect()) as conn:
+            with conn:
+                row = conn.execute(
+                    f"""
+                    SELECT id, user_id, memory_type, content, confidence,
+                           memory_status, created_at, updated_at, source_type,
+                           source_summary, last_evidence
+                    FROM user_memory
+                    WHERE user_id = ?
+                      AND COALESCE(memory_type, '') = COALESCE(?, '')
+                      AND TRIM(content) = ?
+                      AND memory_status IN ({placeholders})
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (user_id, memory_type, content, *statuses),
+                ).fetchone()
+        return dict(row) if row else None
+
     def update_memory_status(self, memory_id: int, new_status: str) -> bool:
         """Update a memory status directly."""
         self._validate_memory_status(new_status)

@@ -76,6 +76,19 @@ class MemoryStoreTest(unittest.TestCase):
             self.assertEqual(records[1]["source_summary"], "first summary")
             self.assertEqual(records[1]["last_evidence"], "first evidence")
 
+    def test_find_duplicate_memory_matches_same_user_type_and_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            store.init_db()
+            memory_id = store.save_memory("A001", "style", "same fact", 0.8, "stable")
+
+            duplicate = store.find_duplicate_memory("A001", "style", " same fact ")
+
+            self.assertIsNotNone(duplicate)
+            self.assertEqual(duplicate["id"], memory_id)
+            self.assertIsNone(store.find_duplicate_memory("A001", "other", "same fact"))
+            self.assertIsNone(store.find_duplicate_memory("B001", "style", "same fact"))
+
     def test_update_memory_status(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(Path(tmp) / "memory.db")

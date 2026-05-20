@@ -14,15 +14,21 @@ class SemanticRetriever:
     still run without network installs.
     """
 
+    DEFAULT_COLLECTION_NAME = "user_memory_bge_base_zh_v15"
+    DEFAULT_MODEL_NAME = "BAAI/bge-base-zh-v1.5"
+    DEFAULT_QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
+
     def __init__(
         self,
         persist_path: str | Path = "chroma_memory",
-        collection_name: str = "user_memory",
-        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        collection_name: str = DEFAULT_COLLECTION_NAME,
+        model_name: str = DEFAULT_MODEL_NAME,
+        query_instruction: str = DEFAULT_QUERY_INSTRUCTION,
     ) -> None:
         self.persist_path = Path(persist_path)
         self.collection_name = collection_name
         self.model_name = model_name
+        self.query_instruction = query_instruction
         self._fallback_items: dict[str, dict[str, Any]] = {}
 
         self._model = None
@@ -96,7 +102,7 @@ class SemanticRetriever:
             ]
         }
         results = self._collection.query(
-            query_embeddings=[self._embed(query_text)],
+            query_embeddings=[self._embed(self._build_query_text(query_text))],
             n_results=top_k,
             where=where,
             include=["metadatas", "distances"],
@@ -158,6 +164,16 @@ class SemanticRetriever:
     def _embed(self, text: str) -> list[float]:
         embedding = self._model.encode(text, normalize_embeddings=True)
         return embedding.tolist()
+
+    def _build_query_text(self, query_text: str) -> str:
+        """Apply the BGE retrieval instruction to query text only.
+
+        Memory documents are embedded as-is in add_memory(). The instruction is
+        only prepended when embedding a user/search query for retrieval.
+        """
+        if not self.query_instruction:
+            return query_text
+        return f"{self.query_instruction}{query_text}"
 
     def _fallback_query(
         self,

@@ -52,7 +52,7 @@ except Exception:  # pragma: no cover
 
 from .active_memory_cache import ActiveMemoryCache
 from .input_filter import InputFilter
-from .llm_client import BaseLLMClient, MockLLMClient
+from .llm_client import BaseLLMClient, LLMClient
 from .memory_store import MemoryStore, classify_memory_status
 from .models import (
     extract_changed_summary,
@@ -85,7 +85,7 @@ class GraphMemoryAgent:
         active_memory_cache: ActiveMemoryCache | None = None,
     ) -> None:
         self.memory_store = memory_store
-        self.llm_client = llm_client or MockLLMClient()
+        self.llm_client = llm_client or LLMClient()
         self.input_filter = input_filter or InputFilter()
         self.semantic_retriever = semantic_retriever or SemanticRetriever()
         self.active_memory_cache = active_memory_cache or ActiveMemoryCache()
@@ -473,7 +473,7 @@ class GraphMemoryAgent:
                 "memories": stable_memories,
             },
         )
-        return {"reply": extract_reply(output)}
+        return {"reply": extract_reply(output), "status": "processed"}
 
     def learning_llm(self, state: AgentState) -> dict[str, Any]:
         try:
@@ -555,7 +555,7 @@ class GraphMemoryAgent:
                 "changed_summary": state.get("changed_summary"),
             },
         )
-        return {"reply": extract_reply(output)}
+        return {"reply": extract_reply(output), "status": "processed"}
 
     def save_session_state(self, state: AgentState) -> dict[str, Any]:
         if state.get("status") in {"skipped", "missing_user_id", "missing_context", "sync_failed"}:
@@ -692,6 +692,43 @@ class GraphMemoryAgent:
                 if is_new_memory:
                     if memory_status == "discard":
                         self.active_memory_cache.remove_memory(memory_id)
+                        continue
+                    duplicate_record = self.memory_store.find_duplicate_memory(
+                        user_id=memory["user_id"],
+                        memory_type=memory.get("memory_type"),
+                        content=memory["content"],
+                    )
+                    if duplicate_record:
+                        duplicate_id = int(duplicate_record["id"])
+                        self.active_memory_cache.replace_memory_id(
+                            str(memory_id),
+                            duplicate_id,
+                            duplicate_record,
+                        )
+                        reviewed_memories.append(
+                            {
+                                "memory_id": duplicate_id,
+                                "reviewed": False,
+                                "duplicate": True,
+                                "memory_status": duplicate_record.get("memory_status"),
+                            }
+                        )
+                        try:
+                            self.semantic_retriever.add_memory(
+                                memory_id=duplicate_id,
+                                user_id=duplicate_record["user_id"],
+                                content=duplicate_record["content"],
+                                memory_status=duplicate_record["memory_status"],
+                                memory_type=duplicate_record.get("memory_type"),
+                            )
+                        except Exception as exc:
+                            sync_errors.append(
+                                {
+                                    "memory_id": duplicate_id,
+                                    "error": f"index_sync_failed:{exc}",
+                                }
+                            )
+                            self.active_memory_cache.mark_dirty(duplicate_id)
                         continue
                     real_id = self.memory_store.save_memory(
                         user_id=memory["user_id"],

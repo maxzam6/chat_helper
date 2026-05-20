@@ -17,18 +17,26 @@ def messages_to_chat_text(messages: list[dict[str, Any]]) -> str:
 
 
 def parse_llm_json(value: Any) -> dict[str, Any]:
-    """Parse generic model JSON output; return {} on malformed content."""
+    """Parse generic model JSON output; return {} on malformed content.
+
+    Real models occasionally wrap JSON in markdown fences or add a short prefix.
+    This helper accepts dicts directly, plain JSON strings, fenced JSON blocks,
+    and strings that contain one JSON object.
+    """
     if isinstance(value, dict):
         return value
     if not isinstance(value, str):
         return {}
 
     cleaned = _strip_markdown_json_block(value)
-    try:
-        parsed = json.loads(cleaned)
-    except json.JSONDecodeError:
+    parsed = _loads_dict(cleaned)
+    if parsed:
+        return parsed
+
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if not match:
         return {}
-    return parsed if isinstance(parsed, dict) else {}
+    return _loads_dict(match.group(0))
 
 
 def extract_intent_result(output: dict[str, Any]) -> dict[str, Any]:
@@ -173,7 +181,7 @@ def _strip_markdown_json_block(text: str) -> str:
         lines = cleaned.splitlines()
         if lines:
             first_line = lines[0].strip()
-            if first_line in {"```", "```json", "```JSON"}:
+            if first_line == "```" or first_line.lower() == "```json":
                 lines = lines[1:]
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
@@ -181,32 +189,9 @@ def _strip_markdown_json_block(text: str) -> str:
     return cleaned
 
 
-
-
-def parse_llm_json(text: str) -> dict:
-
-    if not text:
-        return {}
-
-    text = text.strip()
-
-    # 去 markdown code block
-    text = re.sub(r"^```json", "", text)
-    text = re.sub(r"^```", "", text)
-    text = re.sub(r"```$", "", text)
-
-    text = text.strip()
-
-    # 提取最外层 JSON
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-
-    if not match:
-        return {}
-
-    json_text = match.group(0)
-
+def _loads_dict(text: str) -> dict[str, Any]:
     try:
-        return json.loads(json_text)
-
-    except Exception:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
         return {}
+    return parsed if isinstance(parsed, dict) else {}
