@@ -303,31 +303,41 @@ class GraphMemoryAgent:
         if not current_user_id:
             return {"status": "missing_user_id"}
 
+        context_switch_error = state.get("error")
         if self.active_memory_cache.user_id and self.active_memory_cache.user_id != current_user_id:
             context_switch_sync_result = None
             dirty_memories = [dict(memory) for memory in self.active_memory_cache.get_dirty_memories()]
             if dirty_memories:
                 context_switch_sync_result = self._sync_dirty_memory_entries(dirty_memories)
                 if context_switch_sync_result["sync_errors"]:
-                    return {
-                        "status": "sync_failed",
-                        "error": self._merge_error(state.get("error"), "context_switch_sync_failed"),
-                        "context_switch_sync_result": context_switch_sync_result,
-                    }
-                self.active_memory_cache.clear_dirty()
+                    context_switch_sync_result["forced_user_switch"] = True
+                    context_switch_sync_result["unsynced_dirty_memories"] = [
+                        dict(memory) for memory in self.active_memory_cache.get_dirty_memories()
+                    ]
+                    context_switch_error = self._merge_error(
+                        state.get("error"),
+                        "context_switch_sync_failed",
+                    )
+                else:
+                    self.active_memory_cache.clear_dirty()
             self.active_memory_cache.clear()
         else:
             context_switch_sync_result = state.get("context_switch_sync_result")
 
         session_state = self.memory_store.get_session_state(state.get("me_id") or "default", current_user_id)
         working_memory = self.memory_store.get_working_memory_observations(current_user_id)
+        user_id_suggestions = []
+        if session_state is None and not working_memory and not self.memory_store.user_id_exists(current_user_id):
+            user_id_suggestions = self.memory_store.find_similar_user_ids(current_user_id)
         return {
             "active_user_id": current_user_id,
             "session_state": session_state,
             "working_memory": working_memory,
             "last_retrieval_query": session_state.get("last_retrieval_query") if session_state else None,
             "context_switch_sync_result": context_switch_sync_result,
+            "user_id_suggestions": user_id_suggestions,
             "status": "user_context_ready",
+            "error": context_switch_error,
         }
 
     def reply_missing_user_id(self, state: AgentState) -> dict[str, Any]:
@@ -624,7 +634,7 @@ class GraphMemoryAgent:
         return "has_last_reply" if state.get("last_reply") else "no_last_reply"
 
     def route_after_user_context(self, state: AgentState) -> str:
-        if state.get("status") in {"missing_user_id", "sync_failed"}:
+        if state.get("status") == "missing_user_id":
             return "missing_user_id"
         return state.get("intent") or "reply_advice"
 
@@ -909,6 +919,7 @@ class GraphMemoryAgent:
             "discarded_memory_ids": [],
             "sync_errors": [],
             "context_switch_sync_result": None,
+            "user_id_suggestions": [],
             "status": "started",
             "error": None,
         }
@@ -935,6 +946,7 @@ class GraphMemoryAgent:
             "task_results": state.get("task_results", []),
             "input_summary": state.get("input_summary"),
             "active_user_id": state.get("active_user_id"),
+            "user_id_suggestions": state.get("user_id_suggestions", []),
             "reply": state.get("reply"),
             "working_memory": state.get("working_memory", []),
             "retrieval_query": state.get("retrieval_query"),

@@ -4,3 +4,9 @@ __pycache__/
 memory.db
 memory.db.bak-*
 chroma_memory/
+chat-agent/node_modules/
+chat-agent/dist/
+chat-agent/.env.local
+chat-agent/.npm-cache/
+api-server*.log
+frontend-server*.log

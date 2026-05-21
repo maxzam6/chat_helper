@@ -89,6 +89,24 @@ class MemoryStoreTest(unittest.TestCase):
             self.assertIsNone(store.find_duplicate_memory("A001", "other", "same fact"))
             self.assertIsNone(store.find_duplicate_memory("B001", "style", "same fact"))
 
+    def test_find_similar_user_ids_from_persisted_tables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            store.init_db()
+            store.save_memory("A001", "style", "fact", 0.8, "stable")
+            store.save_session_state("default", "B002", {"last_intent": "reply_advice"})
+            store.update_working_memory_observations("A001_wechat", [{"content": "state"}])
+
+            self.assertTrue(store.user_id_exists("A001"))
+            self.assertFalse(store.user_id_exists("A01"))
+
+            suggestions = store.find_similar_user_ids("a01")
+
+            self.assertGreaterEqual(len(suggestions), 1)
+            self.assertEqual(suggestions[0]["user_id"], "A001")
+            self.assertIn(suggestions[0]["match_type"], {"similarity", "partial"})
+            self.assertIn("user_memory", suggestions[0]["sources"])
+
     def test_update_memory_status(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(Path(tmp) / "memory.db")

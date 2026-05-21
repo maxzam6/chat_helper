@@ -53,6 +53,7 @@ class AgentState(TypedDict, total=False):
     context_switch_sync_result: dict[str, Any] | None
     session_state_saved: bool | None
     reason: str | None
+    user_id_suggestions: list[dict[str, Any]]
 
     status: str
     error: str | None

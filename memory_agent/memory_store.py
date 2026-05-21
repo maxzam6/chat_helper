@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import closing
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -142,6 +143,71 @@ class MemoryStore:
         """Return conflict memory for conflict-resolution flows."""
         return [row["content"] for row in self._get_memory_rows_by_status(user_id, "conflict")]
 
+    def get_known_user_ids(self) -> list[dict[str, Any]]:
+        """Return known user ids collected from all persisted state tables."""
+        sources_by_user: dict[str, set[str]] = {}
+        table_queries = [
+            ("user_memory", "SELECT DISTINCT user_id FROM user_memory WHERE user_id IS NOT NULL AND user_id != ''"),
+            ("session_state", "SELECT DISTINCT user_id FROM session_state WHERE user_id IS NOT NULL AND user_id != ''"),
+            (
+                "working_memory_observations",
+                "SELECT DISTINCT user_id FROM working_memory_observations WHERE user_id IS NOT NULL AND user_id != ''",
+            ),
+        ]
+        with closing(self._connect()) as conn:
+            with conn:
+                for source, query in table_queries:
+                    rows = conn.execute(query).fetchall()
+                    for row in rows:
+                        user_id = str(row["user_id"])
+                        sources_by_user.setdefault(user_id, set()).add(source)
+
+        return [
+            {
+                "user_id": user_id,
+                "sources": sorted(sources),
+            }
+            for user_id, sources in sorted(sources_by_user.items())
+            if user_id != "global"
+        ]
+
+    def find_similar_user_ids(self, user_id_query: str, limit: int = 5) -> list[dict[str, Any]]:
+        """Suggest existing user ids that may match a newly entered id.
+
+        The backend only suggests candidates. It does not automatically replace
+        current_user_id, because merging two real people by accident is worse
+        than asking the frontend/user to confirm.
+        """
+        query = user_id_query.strip()
+        if not query:
+            return []
+
+        normalized_query = self._normalize_user_id_for_match(query)
+        suggestions: list[dict[str, Any]] = []
+        for item in self.get_known_user_ids():
+            user_id = item["user_id"]
+            normalized_user_id = self._normalize_user_id_for_match(user_id)
+            score = self._score_user_id_match(query, normalized_query, user_id, normalized_user_id)
+            if score <= 0:
+                continue
+            suggestions.append(
+                {
+                    "user_id": user_id,
+                    "score": round(score, 4),
+                    "sources": item["sources"],
+                    "match_type": self._user_id_match_type(query, normalized_query, user_id, normalized_user_id),
+                }
+            )
+
+        suggestions.sort(key=lambda item: (-item["score"], item["user_id"]))
+        return suggestions[:limit]
+
+    def user_id_exists(self, user_id: str) -> bool:
+        """Return whether a user id exists in any persisted state table."""
+        if not user_id:
+            return False
+        return any(item["user_id"] == user_id for item in self.get_known_user_ids())
+
     def get_memory_record(self, memory_id: int) -> dict[str, Any] | None:
         """Return one memory row by id, including status and confidence."""
         with closing(self._connect()) as conn:
@@ -185,6 +251,35 @@ class MemoryStore:
 
         rows_by_id = {int(row["id"]): dict(row) for row in rows}
         return [rows_by_id[memory_id] for memory_id in unique_ids if memory_id in rows_by_id]
+
+    def get_user_memory_records(
+        self,
+        user_id: str,
+        statuses: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return full memory records for one user, grouped by current status."""
+        if not user_id:
+            return []
+        statuses = statuses or ["stable", "pending", "conflict", "discard"]
+        for status in statuses:
+            self._validate_memory_status(status)
+
+        placeholders = ", ".join("?" for _ in statuses)
+        with closing(self._connect()) as conn:
+            with conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT id, user_id, memory_type, content, confidence,
+                           memory_status, created_at, updated_at, source_type,
+                           source_summary, last_evidence
+                    FROM user_memory
+                    WHERE user_id = ?
+                      AND memory_status IN ({placeholders})
+                    ORDER BY id ASC
+                    """,
+                    (user_id, *statuses),
+                ).fetchall()
+        return [dict(row) for row in rows]
 
     def save_memory(
         self,
@@ -618,6 +713,43 @@ class MemoryStore:
         if memory_status not in VALID_MEMORY_STATUSES:
             allowed = ", ".join(sorted(VALID_MEMORY_STATUSES))
             raise ValueError(f"invalid memory_status: {memory_status}; allowed: {allowed}")
+
+    def _score_user_id_match(
+        self,
+        query: str,
+        normalized_query: str,
+        user_id: str,
+        normalized_user_id: str,
+    ) -> float:
+        if user_id == query:
+            return 1.0
+        if normalized_user_id == normalized_query:
+            return 0.98
+        if normalized_query in normalized_user_id or normalized_user_id in normalized_query:
+            shorter = min(len(normalized_query), len(normalized_user_id))
+            longer = max(len(normalized_query), len(normalized_user_id))
+            if shorter > 0:
+                return 0.82 + 0.12 * (shorter / longer)
+        similarity = SequenceMatcher(None, normalized_query, normalized_user_id).ratio()
+        return similarity if similarity >= 0.6 else 0.0
+
+    def _user_id_match_type(
+        self,
+        query: str,
+        normalized_query: str,
+        user_id: str,
+        normalized_user_id: str,
+    ) -> str:
+        if user_id == query:
+            return "exact"
+        if normalized_user_id == normalized_query:
+            return "normalized_exact"
+        if normalized_query in normalized_user_id or normalized_user_id in normalized_query:
+            return "partial"
+        return "similarity"
+
+    def _normalize_user_id_for_match(self, user_id: str) -> str:
+        return "".join(ch for ch in user_id.lower().strip() if ch.isalnum())
 
     def _connect(self) -> sqlite3.Connection:
         if self.db_path.parent != Path("."):

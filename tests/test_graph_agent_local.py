@@ -247,6 +247,28 @@ class GraphMemoryAgentLocalTest(unittest.TestCase):
             self.assertTrue(result["session_state_saved"])
             self.assertTrue(store.get_user_memory("A001"))
 
+    def test_unknown_similar_user_id_returns_suggestions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            store.init_db()
+            store.save_memory("A001", "style", "known user memory", 0.8, "stable")
+            llm = RecordingLLMClient()
+            agent, _ = make_agent(store, llm)
+
+            result = agent.process(
+                {
+                    "me_id": "default",
+                    "current_user_id": "A01",
+                    "user_input": "\u5979\u56de\u6211\u54e6\uff0c\u6211\u8be5\u600e\u4e48\u56de\uff1f",
+                    "chat_context": make_chat_context(),
+                },
+                return_full_state=True,
+            )
+
+            self.assertEqual(result["active_user_id"], "A01")
+            self.assertTrue(result["user_id_suggestions"])
+            self.assertEqual(result["user_id_suggestions"][0]["user_id"], "A001")
+
     def test_skipped_input_does_not_overwrite_last_reply(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(Path(tmp) / "memory.db")
@@ -488,6 +510,40 @@ class GraphMemoryAgentLocalTest(unittest.TestCase):
             self.assertTrue(result["context_switch_sync_result"]["saved_memory_ids"])
             self.assertEqual(store.get_user_memory("A001"), ["A001 pending memory"])
             self.assertEqual(agent.active_memory_cache.user_id, "A002")
+
+    def test_user_switch_continues_when_dirty_sync_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            llm = RecordingLLMClient()
+            agent, _ = make_agent(store, llm, FailingAddRetriever())
+            agent.active_memory_cache.set_cache("A001", "old user", [])
+            agent.active_memory_cache.add_pending_memory(
+                {
+                    "user_id": "A001",
+                    "memory_type": "conversation_style",
+                    "content": "A001 pending memory",
+                    "confidence": 0.8,
+                    "memory_status": "stable",
+                    "source_type": "reply_advice",
+                    "source_summary": "old summary",
+                }
+            )
+
+            result = agent.process(
+                {
+                    "me_id": "default",
+                    "current_user_id": "A002",
+                    "user_input": "\u8bb0\u4e00\u4e0b\uff0c\u5979\u5e73\u65f6\u8bdd\u5c11\uff0c\u4e0d\u662f\u51b7\u6de1",
+                },
+                return_full_state=True,
+            )
+
+            self.assertEqual(result["active_user_id"], "A002")
+            self.assertEqual(agent.active_memory_cache.user_id, "A002")
+            self.assertTrue(result["context_switch_sync_result"]["sync_errors"])
+            self.assertTrue(result["context_switch_sync_result"]["forced_user_switch"])
+            self.assertIn("context_switch_sync_failed", result["error"])
+            self.assertEqual(store.get_user_memory("A001"), ["A001 pending memory"])
 
     def test_sync_error_keeps_dirty_memory_for_retry(self):
         with tempfile.TemporaryDirectory() as tmp:

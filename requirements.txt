@@ -5,6 +5,8 @@ langgraph
 sentence-transformers
 openai
 python-dotenv
+fastapi
+uvicorn
 langchain
 langchain-openai
 numpy
