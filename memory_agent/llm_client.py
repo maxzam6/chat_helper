@@ -151,19 +151,9 @@ class LLMClient(BaseLLMClient):
             raise RuntimeError("LLM_MODEL is required when using the real LLMClient.")
 
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
-        self.vision_api_key = os.getenv("VISION_LLM_API_KEY") or self.api_key
-        self.vision_base_url = os.getenv("VISION_LLM_BASE_URL") or self.base_url
-        self.vision_model = os.getenv("VISION_LLM_MODEL") or self.model
-        self.vision_client = OpenAI(
-            api_key=self.vision_api_key,
-            base_url=self.vision_base_url,
-        )
 
     def generate_json(self, task: str, inputs: dict[str, Any]) -> dict[str, Any]:
         system_prompt = self._load_prompt(task)
-        if task == "ocr" and inputs.get("screenshot_base64"):
-            return self._generate_vision_json(system_prompt, inputs)
-
         user_content = json.dumps(inputs, ensure_ascii=False, indent=2)
         request_kwargs: dict[str, Any] = {
             "model": self.model,
@@ -177,41 +167,6 @@ class LLMClient(BaseLLMClient):
             request_kwargs["response_format"] = {"type": self.response_format}
 
         response = self.client.chat.completions.create(**request_kwargs)
-        text = response.choices[0].message.content or ""
-        return parse_llm_json(text)
-
-    def _generate_vision_json(
-        self,
-        system_prompt: str,
-        inputs: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Run the OCR/vision task with an image message when a screenshot exists."""
-        screenshot = str(inputs.get("screenshot_base64") or "")
-        if not screenshot.startswith("data:image/"):
-            screenshot = f"data:image/png;base64,{screenshot}"
-
-        text_inputs = dict(inputs)
-        text_inputs["screenshot_base64"] = "[image attached]"
-        user_text = json.dumps(text_inputs, ensure_ascii=False, indent=2)
-
-        request_kwargs: dict[str, Any] = {
-            "model": self.vision_model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_text},
-                        {"type": "image_url", "image_url": {"url": screenshot}},
-                    ],
-                },
-            ],
-            "temperature": self.temperature,
-        }
-        if self.response_format and self.response_format.lower() != "none":
-            request_kwargs["response_format"] = {"type": self.response_format}
-
-        response = self.vision_client.chat.completions.create(**request_kwargs)
         text = response.choices[0].message.content or ""
         return parse_llm_json(text)
 

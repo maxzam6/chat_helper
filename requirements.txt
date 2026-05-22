@@ -10,3 +10,5 @@ uvicorn
 langchain
 langchain-openai
 numpy
+mss
+pynput

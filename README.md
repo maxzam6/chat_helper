@@ -56,10 +56,12 @@ LLM_MODEL=deepseek-chat
 LLM_TEMPERATURE=0.2
 LLM_RESPONSE_FORMAT=json_object
 
-# Optional: use a separate vision-capable model for screenshot understanding.
-VISION_LLM_API_KEY=your_vision_api_key_here
-VISION_LLM_BASE_URL=https://api.openai.com/v1
-VISION_LLM_MODEL=gpt-4o-mini
+# Optional: independent vision-capable model for screenshot understanding.
+VISION_API_KEY=your_vision_api_key_here
+VISION_BASE_URL=https://api.openai.com/v1
+VISION_MODEL=gpt-4o-mini
+VISION_TEMPERATURE=0.0
+VISION_TIMEOUT=60
 ```
 
 ## Semantic Retrieval
@@ -103,19 +105,22 @@ GET  /api/users/{user_id}/working-memory
 ```
 
 Screenshot uploads are sent to the backend as `screenshot_base64`. The frontend
-does not run OCR; the backend `ocr` task is reserved for the Vision LLM.
+does not run OCR. If no screenshot is uploaded, the frontend sends a fixed
+`screenshot_region` rectangle and the backend captures only that screen area
+before calling the independent `VisionLLMClient`.
 
 ## Dependencies
 
-Core SQLite behavior uses the Python standard library. Optional graph and semantic retrieval dependencies:
+Core SQLite behavior uses the Python standard library. Optional graph, screenshot, and semantic retrieval dependencies:
 
 ```text
 langgraph
 chromadb
 sentence-transformers
+mss
 ```
 
-If `chromadb` / `sentence-transformers` are not installed or cannot load locally, `SemanticRetriever` falls back to a simple lexical index. If `langgraph` is not installed, `graph_agent.py` includes a minimal local runner for development tests.
+If `chromadb` / `sentence-transformers` are not installed or cannot load locally, `SemanticRetriever` falls back to a simple lexical index. If `langgraph` is not installed, `graph_agent.py` includes a minimal local runner for development tests. `mss` is required only for fixed-region desktop screenshot capture.
 
 ## Test
 

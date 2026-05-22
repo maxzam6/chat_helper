@@ -56,17 +56,20 @@ from .llm_client import BaseLLMClient, LLMClient
 from .memory_store import MemoryStore, classify_memory_status
 from .models import (
     extract_changed_summary,
-    extract_chat_context,
     extract_intent_result,
     extract_memory_reviews,
     extract_memory_updates,
     extract_reply,
     extract_retrieval_query,
-    extract_working_memory_observations,
     messages_to_chat_text,
 )
 from .semantic_retriever import SemanticRetriever
 from .state import AgentState
+from .vision_llm_client import BaseVisionLLMClient
+from tools.chat_screenshot_tool import (
+    capture_and_parse_chat_tool,
+    parse_uploaded_chat_screenshot,
+)
 
 
 TASK_PRIORITY = ["general_question", "revise_reply", "reply_advice", "profile_update"]
@@ -83,9 +86,11 @@ class GraphMemoryAgent:
         input_filter: InputFilter | None = None,
         semantic_retriever: SemanticRetriever | None = None,
         active_memory_cache: ActiveMemoryCache | None = None,
+        vision_llm_client: BaseVisionLLMClient | None = None,
     ) -> None:
         self.memory_store = memory_store
         self.llm_client = llm_client or LLMClient()
+        self.vision_llm_client = vision_llm_client
         self.input_filter = input_filter or InputFilter()
         self.semantic_retriever = semantic_retriever or SemanticRetriever()
         self.active_memory_cache = active_memory_cache or ActiveMemoryCache()
@@ -102,8 +107,11 @@ class GraphMemoryAgent:
         graph.add_node("revise_reply", self.revise_reply)
         graph.add_node("check_user_context", self.check_user_context)
         graph.add_node("reply_missing_user_id", self.reply_missing_user_id)
-        graph.add_node("take_screenshot_or_mock", self.take_screenshot_or_mock)
-        graph.add_node("ocr_vision_llm", self.ocr_vision_llm)
+        graph.add_node("capture_and_parse_chat", self.capture_and_parse_chat)
+        graph.add_node("reply_invalid_chat_window", self.reply_invalid_chat_window)
+        graph.add_node("reply_screenshot_failed", self.reply_screenshot_failed)
+        graph.add_node("reply_vision_parse_failed", self.reply_vision_parse_failed)
+        graph.add_node("reply_user_id_change_detected", self.reply_user_id_change_detected)
         graph.add_node("input_filter", self.input_filter_node)
         graph.add_node("reply_input_skipped", self.reply_input_skipped)
         graph.add_node("update_working_memory", self.update_working_memory)
@@ -147,13 +155,27 @@ class GraphMemoryAgent:
             self.route_after_user_context,
             {
                 "missing_user_id": "reply_missing_user_id",
-                "reply_advice": "take_screenshot_or_mock",
+                "reply_advice": "capture_and_parse_chat",
                 "profile_update": "retrieval_query_llm",
             },
         )
         graph.add_edge("reply_missing_user_id", "save_session_state")
-        graph.add_edge("take_screenshot_or_mock", "ocr_vision_llm")
-        graph.add_edge("ocr_vision_llm", "input_filter")
+        graph.add_conditional_edges(
+            "capture_and_parse_chat",
+            self.route_after_chat_capture,
+            {
+                "valid": "input_filter",
+                "invalid": "reply_invalid_chat_window",
+                "screenshot_failed": "reply_screenshot_failed",
+                "vision_parse_failed": "reply_vision_parse_failed",
+                "user_id_change_detected": "reply_user_id_change_detected",
+                "missing_user_id": "reply_missing_user_id",
+            },
+        )
+        graph.add_edge("reply_invalid_chat_window", "save_session_state")
+        graph.add_edge("reply_screenshot_failed", "save_session_state")
+        graph.add_edge("reply_vision_parse_failed", "save_session_state")
+        graph.add_edge("reply_user_id_change_detected", "save_session_state")
         graph.add_conditional_edges(
             "input_filter",
             self.route_input_filter,
@@ -301,6 +323,12 @@ class GraphMemoryAgent:
     def check_user_context(self, state: AgentState) -> dict[str, Any]:
         current_user_id = state.get("current_user_id")
         if not current_user_id:
+            if self._can_capture_user_id_from_vision(state):
+                return {
+                    "status": "user_context_pending_vision",
+                    "active_user_id": None,
+                    "working_memory": [],
+                }
             return {"status": "missing_user_id"}
 
         context_switch_error = state.get("error")
@@ -359,28 +387,123 @@ class GraphMemoryAgent:
             "status": "missing_user_id",
         }
 
-    def take_screenshot_or_mock(self, state: AgentState) -> dict[str, Any]:
-        if state.get("chat_context"):
-            return {}
-        return {"screenshot_path": state.get("screenshot_path") or "mock://screenshot"}
-
-    def ocr_vision_llm(self, state: AgentState) -> dict[str, Any]:
+    def capture_and_parse_chat(self, state: AgentState) -> dict[str, Any]:
         existing_chat_context = state.get("chat_context") or {}
-        output = self.llm_client.generate_json(
-            task="ocr",
-            inputs={
-                "user_input": state.get("user_input", ""),
+        if existing_chat_context:
+            recent_messages = existing_chat_context.get("recent_messages", [])
+            return {
                 "chat_context": existing_chat_context,
-                "screenshot_base64": state.get("screenshot_base64"),
-                "screenshot_path": state.get("screenshot_path"),
-            },
-        )
-        llm_chat_context = extract_chat_context(output)
-        chat_context = existing_chat_context or llm_chat_context
+                "chat_text": messages_to_chat_text(recent_messages),
+                "working_memory_observations": state.get("working_memory_observations")
+                or self._context_observations(recent_messages),
+            "is_valid_chat_window": True,
+            "validation_reason": "chat_context_provided",
+            "recognized_user_id": state.get("current_user_id"),
+            "user_id_change_detected": False,
+        }
+
+        if self.vision_llm_client is None:
+            return {
+                "status": "vision_parse_failed",
+                "vision_error": "vision_llm_client_required",
+                "validation_reason": "vision_llm_client_required",
+            }
+
+        try:
+            if state.get("screenshot_base64"):
+                parsed = parse_uploaded_chat_screenshot(
+                    state["screenshot_base64"],
+                    state.get("user_input", ""),
+                    self.vision_llm_client,
+                )
+            else:
+                screenshot_region = state.get("screenshot_region")
+                if not screenshot_region:
+                    return {
+                        "status": "screenshot_failed",
+                        "vision_error": "screenshot_region_required",
+                        "validation_reason": "screenshot_region_required",
+                    }
+                parsed = capture_and_parse_chat_tool(
+                    screenshot_region,
+                    state.get("user_input", ""),
+                    self.vision_llm_client,
+                )
+        except RuntimeError as exc:
+            reason = str(exc)
+            if reason.startswith("screenshot_failed") or "screenshot" in reason:
+                return {
+                    "status": "screenshot_failed",
+                    "vision_error": reason,
+                    "validation_reason": reason,
+                }
+            return {
+                "status": "vision_parse_failed",
+                "vision_error": reason,
+                "validation_reason": reason,
+            }
+        except Exception as exc:
+            return {
+                "status": "vision_parse_failed",
+                "vision_error": str(exc),
+                "validation_reason": str(exc),
+            }
+
         return {
-            "chat_context": chat_context,
-            "chat_text": messages_to_chat_text(chat_context.get("recent_messages", [])),
-            "working_memory_observations": extract_working_memory_observations(output),
+            "screenshot_base64": parsed.get("screenshot_base64"),
+            "chat_context": parsed.get("chat_context") or {},
+            "chat_text": parsed.get("chat_text") or "",
+            "working_memory_observations": parsed.get("working_memory_observations") or [],
+            "is_valid_chat_window": parsed.get("is_valid_chat_window") is True,
+            "validation_reason": parsed.get("validation_reason") or "",
+            "recognized_user_id": parsed.get("recognized_user_id"),
+            "user_id_change_detected": self._is_user_id_change_detected(
+                state.get("current_user_id"),
+                parsed.get("recognized_user_id"),
+            ),
+            "status": "chat_captured",
+        }
+
+    def reply_invalid_chat_window(self, state: AgentState) -> dict[str, Any]:
+        return {
+            "status": "invalid_chat_window",
+            "reply": {
+                "should_reply": False,
+                "content": "未检测到有效聊天窗口，请将聊天窗口放入识别区域后再试。",
+                "reason": state.get("validation_reason") or "invalid_chat_window",
+            },
+        }
+
+    def reply_screenshot_failed(self, state: AgentState) -> dict[str, Any]:
+        return {
+            "status": "screenshot_failed",
+            "reply": {
+                "should_reply": False,
+                "content": "截图失败，请确认聊天窗口在识别区域内。",
+                "reason": "screenshot_failed",
+            },
+        }
+
+    def reply_vision_parse_failed(self, state: AgentState) -> dict[str, Any]:
+        reason = state.get("vision_error") or state.get("validation_reason") or "vision_parse_failed"
+        return {
+            "status": "vision_parse_failed",
+            "reply": {
+                "should_reply": False,
+                "content": f"聊天窗口解析失败，请重试。原因：{reason}",
+                "reason": reason,
+            },
+        }
+
+    def reply_user_id_change_detected(self, state: AgentState) -> dict[str, Any]:
+        recognized_user_id = state.get("recognized_user_id") or ""
+        return {
+            "status": "user_id_change_detected",
+            "reply": {
+                "should_reply": False,
+                "content": f"检测到当前聊天对象可能是 {recognized_user_id}，请确认是否切换为该用户后再分析。",
+                "reason": "user_id_change_detected",
+            },
         }
 
     def input_filter_node(self, state: AgentState) -> dict[str, Any]:
@@ -568,7 +691,16 @@ class GraphMemoryAgent:
         return {"reply": extract_reply(output), "status": "processed"}
 
     def save_session_state(self, state: AgentState) -> dict[str, Any]:
-        if state.get("status") in {"skipped", "missing_user_id", "missing_context", "sync_failed"}:
+        if state.get("status") in {
+            "skipped",
+            "missing_user_id",
+            "missing_context",
+            "sync_failed",
+            "invalid_chat_window",
+            "screenshot_failed",
+            "vision_parse_failed",
+            "user_id_change_detected",
+        }:
             return {
                 "session_state_saved": False,
                 "reason": f"not_saved_for_status:{state.get('status')}",
@@ -638,6 +770,20 @@ class GraphMemoryAgent:
             return "missing_user_id"
         return state.get("intent") or "reply_advice"
 
+    def route_after_chat_capture(self, state: AgentState) -> str:
+        status = state.get("status")
+        if status == "screenshot_failed":
+            return "screenshot_failed"
+        if status == "vision_parse_failed":
+            return "vision_parse_failed"
+        if state.get("is_valid_chat_window") is False:
+            return "invalid"
+        if state.get("user_id_change_detected"):
+            return "user_id_change_detected"
+        if not state.get("current_user_id"):
+            return "missing_user_id"
+        return "valid"
+
     def route_input_filter(self, state: AgentState) -> str:
         return "skipped" if state.get("status") == "skipped" else "ok"
 
@@ -649,6 +795,34 @@ class GraphMemoryAgent:
 
     def route_after_sync(self, state: AgentState) -> str:
         return "profile_update" if state.get("intent") == "profile_update" else "reply_advice"
+
+    def _context_observations(self, recent_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not recent_messages:
+            return []
+        return [
+            {
+                "content": f"本轮前端已提供 {len(recent_messages)} 条近期聊天消息。",
+                "confidence": 0.7,
+            }
+        ]
+
+    def _can_capture_user_id_from_vision(self, state: AgentState) -> bool:
+        if state.get("intent") != "reply_advice":
+            return False
+        if state.get("chat_context"):
+            return False
+        return bool(state.get("screenshot_base64") or state.get("screenshot_region"))
+
+    def _is_user_id_change_detected(
+        self,
+        current_user_id: str | None,
+        recognized_user_id: Any,
+    ) -> bool:
+        if not isinstance(recognized_user_id, str) or not recognized_user_id.strip():
+            return False
+        if not current_user_id or not current_user_id.strip():
+            return True
+        return recognized_user_id.strip() != current_user_id.strip()
 
     def _apply_memory_reviews_to_cache(self, memory_reviews: list[dict[str, Any]]) -> list[dict[str, Any]]:
         reviewed: list[dict[str, Any]] = []
@@ -907,6 +1081,12 @@ class GraphMemoryAgent:
             "chat_text": messages_to_chat_text(chat_context.get("recent_messages", [])),
             "screenshot_path": payload.get("screenshot_path"),
             "screenshot_base64": payload.get("screenshot_base64"),
+            "screenshot_region": payload.get("screenshot_region"),
+            "is_valid_chat_window": None,
+            "validation_reason": None,
+            "vision_error": None,
+            "recognized_user_id": None,
+            "user_id_change_detected": False,
             "working_memory_observations": payload.get("working_memory_observations", []),
             "working_memory": [],
             "semantic_results": [],
@@ -947,6 +1127,12 @@ class GraphMemoryAgent:
             "input_summary": state.get("input_summary"),
             "active_user_id": state.get("active_user_id"),
             "user_id_suggestions": state.get("user_id_suggestions", []),
+            "is_valid_chat_window": state.get("is_valid_chat_window"),
+            "validation_reason": state.get("validation_reason"),
+            "vision_error": state.get("vision_error"),
+            "recognized_user_id": state.get("recognized_user_id"),
+            "user_id_change_detected": state.get("user_id_change_detected"),
+            "screenshot_region": state.get("screenshot_region"),
             "reply": state.get("reply"),
             "working_memory": state.get("working_memory", []),
             "retrieval_query": state.get("retrieval_query"),

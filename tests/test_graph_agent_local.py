@@ -11,6 +11,7 @@ from memory_agent.input_filter import InputFilter
 from memory_agent.llm_client import MockLLMClient
 from memory_agent.memory_store import MemoryStore
 from memory_agent.semantic_retriever import SemanticRetriever
+from memory_agent.vision_llm_client import MockVisionLLMClient
 
 
 class RecordingLLMClient(MockLLMClient):
@@ -97,6 +98,7 @@ def make_agent(
     store: MemoryStore,
     llm: RecordingLLMClient,
     retriever: RecordingSemanticRetriever | None = None,
+    vision: MockVisionLLMClient | None = None,
 ) -> tuple[GraphMemoryAgent, RecordingSemanticRetriever]:
     retriever = retriever or RecordingSemanticRetriever()
     agent = GraphMemoryAgent(
@@ -105,6 +107,7 @@ def make_agent(
         input_filter=InputFilter(),
         semantic_retriever=retriever,
         active_memory_cache=ActiveMemoryCache(),
+        vision_llm_client=vision,
     )
     return agent, retriever
 
@@ -205,7 +208,7 @@ class GraphMemoryAgentLocalTest(unittest.TestCase):
             )
 
             self.assertEqual(result["intent"], "reply_advice")
-            self.assertIn("ocr", llm.tasks)
+            self.assertNotIn("ocr", llm.tasks)
             self.assertIn("retrieval_query", llm.tasks)
             self.assertIn("learning", llm.tasks)
             self.assertTrue(result["working_memory"])
@@ -220,6 +223,207 @@ class GraphMemoryAgentLocalTest(unittest.TestCase):
             self.assertTrue(store.get_working_memory_observations("A001"))
             self.assertIsNotNone(store.get_session_state("default", "A001"))
             self.assertTrue(retriever.added)
+
+    def test_reply_advice_existing_chat_context_does_not_require_screenshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            llm = RecordingLLMClient()
+            agent, _ = make_agent(store, llm)
+
+            result = agent.process(
+                {
+                    "me_id": "default",
+                    "current_user_id": "A001",
+                    "user_input": "\u5979\u56de\u6211\u54e6\uff0c\u6211\u8be5\u600e\u4e48\u56de\uff1f",
+                    "chat_context": make_chat_context(),
+                },
+                return_full_state=True,
+            )
+
+            self.assertEqual(result["intent"], "reply_advice")
+            self.assertTrue(result["is_valid_chat_window"])
+            self.assertEqual(result["validation_reason"], "chat_context_provided")
+            self.assertTrue(result["working_memory_observations"])
+            self.assertTrue(result["reply"])
+
+    def test_invalid_chat_window_does_not_save_session_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            llm = RecordingLLMClient()
+            vision = MockVisionLLMClient(
+                {
+                    "is_valid_chat_window": False,
+                    "validation_reason": "not_a_chat_window",
+                    "chat_context": {"recent_messages": [], "previous_recent_messages": []},
+                    "working_memory_observations": [],
+                }
+            )
+            agent, _ = make_agent(store, llm, vision=vision)
+
+            result = agent.process(
+                {
+                    "me_id": "default",
+                    "current_user_id": "A001",
+                    "user_input": "\u5979\u56de\u6211\u54e6\uff0c\u6211\u8be5\u600e\u4e48\u56de\uff1f",
+                    "screenshot_region": {
+                        "left": 420,
+                        "top": 80,
+                        "width": 900,
+                        "height": 900,
+                        "mock_image_base64": "mock-image",
+                    },
+                },
+                return_full_state=True,
+            )
+
+            self.assertEqual(result["status"], "invalid_chat_window")
+            self.assertFalse(result["session_state_saved"])
+            self.assertIn("\u672a\u68c0\u6d4b\u5230\u6709\u6548\u804a\u5929\u7a97\u53e3", result["reply"]["content"])
+            self.assertEqual(store.get_session_state("default", "A001"), None)
+
+    def test_screenshot_region_uses_vision_client_and_continues_reply_advice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            llm = RecordingLLMClient()
+            vision = MockVisionLLMClient()
+            agent, _ = make_agent(store, llm, vision=vision)
+
+            result = agent.process(
+                {
+                    "me_id": "default",
+                    "current_user_id": "A001",
+                    "user_input": "\u5979\u56de\u6211\u54e6\uff0c\u6211\u8be5\u600e\u4e48\u56de\uff1f",
+                    "screenshot_region": {
+                        "left": 420,
+                        "top": 80,
+                        "width": 900,
+                        "height": 900,
+                        "mock_image_base64": "mock-image",
+                    },
+                },
+                return_full_state=True,
+            )
+
+            self.assertEqual(len(vision.calls), 1)
+            self.assertTrue(result["is_valid_chat_window"])
+            self.assertTrue(result["chat_context"])
+            self.assertTrue(result["working_memory_observations"])
+            self.assertTrue(result["reply"])
+            self.assertTrue(result["saved_memory_ids"])
+
+    def test_screenshot_region_without_vision_client_returns_clear_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            llm = RecordingLLMClient()
+            agent, _ = make_agent(store, llm)
+
+            result = agent.process(
+                {
+                    "me_id": "default",
+                    "current_user_id": "A001",
+                    "user_input": "\u5979\u56de\u6211\u54e6\uff0c\u6211\u8be5\u600e\u4e48\u56de\uff1f",
+                    "screenshot_region": {"left": 420, "top": 80, "width": 900, "height": 900},
+                },
+                return_full_state=True,
+            )
+
+            self.assertEqual(result["status"], "vision_parse_failed")
+            self.assertEqual(result["vision_error"], "vision_llm_client_required")
+            self.assertFalse(result["session_state_saved"])
+
+    def test_recognized_user_id_change_stops_before_memory_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            llm = RecordingLLMClient()
+            vision = MockVisionLLMClient(
+                {
+                    "is_valid_chat_window": True,
+                    "validation_reason": "valid",
+                    "recognized_user_id": "A002",
+                    "chat_context": make_chat_context(),
+                    "working_memory_observations": [],
+                }
+            )
+            agent, _ = make_agent(store, llm, vision=vision)
+
+            result = agent.process(
+                {
+                    "me_id": "default",
+                    "current_user_id": "A001",
+                    "user_input": "\u5979\u56de\u6211\u54e6\uff0c\u6211\u8be5\u600e\u4e48\u56de\uff1f",
+                    "screenshot_region": {
+                        "left": 420,
+                        "top": 80,
+                        "width": 900,
+                        "height": 900,
+                        "mock_image_base64": "mock-image",
+                    },
+                },
+                return_full_state=True,
+            )
+
+            self.assertEqual(result["status"], "user_id_change_detected")
+            self.assertTrue(result["user_id_change_detected"])
+            self.assertEqual(result["recognized_user_id"], "A002")
+            self.assertFalse(result["session_state_saved"])
+            self.assertEqual(store.get_user_memory("A001"), [])
+
+    def test_missing_current_user_and_no_recognized_user_stays_missing_user_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            llm = RecordingLLMClient()
+            vision = MockVisionLLMClient(
+                {
+                    "is_valid_chat_window": True,
+                    "validation_reason": "valid",
+                    "recognized_user_id": None,
+                    "chat_context": make_chat_context(),
+                    "working_memory_observations": [],
+                }
+            )
+            agent, _ = make_agent(store, llm, vision=vision)
+
+            result = agent.process(
+                {
+                    "me_id": "default",
+                    "user_input": "\u5979\u56de\u6211\u54e6\uff0c\u6211\u8be5\u600e\u4e48\u56de\uff1f",
+                    "screenshot_region": {
+                        "left": 420,
+                        "top": 80,
+                        "width": 900,
+                        "height": 900,
+                        "mock_image_base64": "mock-image",
+                    },
+                },
+                return_full_state=True,
+            )
+
+            self.assertEqual(result["status"], "missing_user_id")
+            self.assertIsNone(result["recognized_user_id"])
+            self.assertFalse(result["session_state_saved"])
+
+    def test_public_result_includes_vision_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            llm = RecordingLLMClient()
+            agent, _ = make_agent(store, llm)
+
+            result = agent.process(
+                {
+                    "me_id": "default",
+                    "current_user_id": "A001",
+                    "user_input": "\u5979\u56de\u6211\u54e6\uff0c\u6211\u8be5\u600e\u4e48\u56de\uff1f",
+                    "chat_context": make_chat_context(),
+                    "screenshot_region": {"left": 420, "top": 80, "width": 900, "height": 900},
+                }
+            )
+
+            self.assertIn("is_valid_chat_window", result)
+            self.assertIn("validation_reason", result)
+            self.assertIn("vision_error", result)
+            self.assertIn("recognized_user_id", result)
+            self.assertIn("user_id_change_detected", result)
+            self.assertEqual(result["screenshot_region"]["left"], 420)
 
     def test_profile_update_skips_ocr_and_updates_memory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -602,7 +806,7 @@ class GraphMemoryAgentLocalTest(unittest.TestCase):
             self.assertEqual([item["task"] for item in result["task_results"]], expected_tasks)
             self.assertEqual(result["intent"], "profile_update")
             self.assertEqual(llm.tasks.count("intent_classifier"), 1)
-            self.assertEqual(llm.tasks.count("ocr"), 1)
+            self.assertEqual(llm.tasks.count("ocr"), 0)
             self.assertEqual(llm.tasks.count("retrieval_query"), 2)
             self.assertEqual(llm.tasks.count("learning"), 2)
             self.assertGreaterEqual(llm.tasks.count("reply"), 3)

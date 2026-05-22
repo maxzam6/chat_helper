@@ -10,9 +10,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .active_memory_cache import ActiveMemoryCache
 from .graph_agent import GraphMemoryAgent
+from .hotkey_capture import HotkeyCaptureService
 from .llm_client import LLMClient
 from .memory_store import MemoryStore
 from .semantic_retriever import SemanticRetriever
+from .vision_llm_client import VisionLLMClient
 
 load_dotenv()
 
@@ -61,14 +63,34 @@ def get_agent() -> GraphMemoryAgent:
     return GraphMemoryAgent(
         memory_store=get_memory_store(),
         llm_client=LLMClient(),
+        vision_llm_client=get_vision_llm_client(),
         semantic_retriever=get_semantic_retriever(),
         active_memory_cache=ActiveMemoryCache(),
     )
 
 
+@lru_cache(maxsize=1)
+def get_hotkey_capture_service() -> HotkeyCaptureService:
+    service = HotkeyCaptureService(agent_factory=get_agent)
+    service.start()
+    return service
+
+
+@lru_cache(maxsize=1)
+def get_vision_llm_client() -> VisionLLMClient | None:
+    if not os.getenv("VISION_API_KEY") or not os.getenv("VISION_MODEL"):
+        return None
+    return VisionLLMClient()
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.on_event("startup")
+def start_hotkey_capture() -> None:
+    get_hotkey_capture_service()
 
 
 @app.get("/users/suggest")
@@ -104,3 +126,23 @@ def process_agent(payload: dict[str, Any]) -> dict[str, Any]:
         return get_agent().process(payload)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/capture/status")
+def capture_status() -> dict[str, Any]:
+    return get_hotkey_capture_service().status()
+
+
+@app.post("/capture/context")
+def update_capture_context(payload: dict[str, Any]) -> dict[str, Any]:
+    return get_hotkey_capture_service().update_context(payload)
+
+
+@app.post("/capture/trigger")
+def trigger_capture() -> dict[str, Any]:
+    return get_hotkey_capture_service().trigger()
+
+
+@app.post("/capture/cancel")
+def cancel_capture() -> dict[str, Any]:
+    return get_hotkey_capture_service().cancel()
