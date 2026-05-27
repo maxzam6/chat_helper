@@ -67,9 +67,11 @@ from .semantic_retriever import SemanticRetriever
 from .state import AgentState
 from .vision_llm_client import BaseVisionLLMClient
 from tools.chat_screenshot_tool import (
+    ChatScreenshotParseError,
     capture_and_parse_chat_tool,
     parse_uploaded_chat_screenshot,
 )
+from tools.screenshot_tool import capture_region_as_base64
 
 
 TASK_PRIORITY = ["general_question", "revise_reply", "reply_advice", "profile_update"]
@@ -98,6 +100,7 @@ class GraphMemoryAgent:
 
     def build_graph(self) -> StateGraph:
         graph = StateGraph(AgentState)
+        graph.add_node("pre_capture_screenshot", self.pre_capture_screenshot)
         graph.add_node("classify_intent", self.classify_intent)
         graph.add_node("select_next_task", self.select_next_task)
         graph.add_node("reply_general", self.reply_general)
@@ -128,7 +131,8 @@ class GraphMemoryAgent:
         graph.add_node("save_session_state", self.save_session_state)
         graph.add_node("mark_task_done", self.mark_task_done)
 
-        graph.add_edge(START, "classify_intent")
+        graph.add_edge(START, "pre_capture_screenshot")
+        graph.add_edge("pre_capture_screenshot", "classify_intent")
         graph.add_edge("classify_intent", "select_next_task")
         graph.add_conditional_edges(
             "select_next_task",
@@ -215,6 +219,45 @@ class GraphMemoryAgent:
         if return_full_state:
             return state
         return self._public_result(state)
+
+    def pre_capture_screenshot(self, state: AgentState) -> dict[str, Any]:
+        """Take a fast local screenshot before intent routing, without Vision LLM.
+
+        This overlaps the cheap desktop capture with the rest of the graph setup.
+        The expensive Vision model is still only called later by reply_advice.
+        """
+        if state.get("screenshot_base64"):
+            return {
+                "screenshot_captured": True,
+                "screenshot_status": state.get("screenshot_status") or "uploaded",
+                "pre_capture_status": "success",
+                "pre_capture_error": None,
+            }
+
+        screenshot_region = state.get("screenshot_region")
+        if not screenshot_region:
+            return {
+                "pre_capture_status": "skipped",
+                "pre_capture_error": "screenshot_region_required",
+            }
+
+        try:
+            screenshot_base64 = capture_region_as_base64(screenshot_region)
+        except Exception as exc:
+            return {
+                "screenshot_captured": False,
+                "screenshot_status": None,
+                "pre_capture_status": "failed",
+                "pre_capture_error": str(exc),
+            }
+
+        return {
+            "screenshot_base64": screenshot_base64,
+            "screenshot_captured": True,
+            "screenshot_status": "captured",
+            "pre_capture_status": "success",
+            "pre_capture_error": None,
+        }
 
     def classify_intent(self, state: AgentState) -> dict[str, Any]:
         output = self.llm_client.generate_json(
@@ -402,6 +445,14 @@ class GraphMemoryAgent:
             "user_id_change_detected": False,
         }
 
+        if state.get("pre_capture_status") == "failed":
+            reason = state.get("pre_capture_error") or "screenshot_failed"
+            return {
+                "status": "screenshot_failed",
+                "vision_error": reason,
+                "validation_reason": reason,
+            }
+
         if self.vision_llm_client is None:
             return {
                 "status": "vision_parse_failed",
@@ -429,6 +480,15 @@ class GraphMemoryAgent:
                     state.get("user_input", ""),
                     self.vision_llm_client,
                 )
+        except ChatScreenshotParseError as exc:
+            return {
+                "status": "vision_parse_failed",
+                "screenshot_base64": exc.screenshot_base64,
+                "screenshot_captured": True,
+                "screenshot_status": "captured",
+                "vision_error": str(exc),
+                "validation_reason": str(exc),
+            }
         except RuntimeError as exc:
             reason = str(exc)
             if reason.startswith("screenshot_failed") or "screenshot" in reason:
@@ -451,6 +511,8 @@ class GraphMemoryAgent:
 
         return {
             "screenshot_base64": parsed.get("screenshot_base64"),
+            "screenshot_captured": state.get("screenshot_captured") or parsed.get("screenshot_captured") is True,
+            "screenshot_status": state.get("screenshot_status") or parsed.get("screenshot_status"),
             "chat_context": parsed.get("chat_context") or {},
             "chat_text": parsed.get("chat_text") or "",
             "working_memory_observations": parsed.get("working_memory_observations") or [],
@@ -1082,6 +1144,10 @@ class GraphMemoryAgent:
             "screenshot_path": payload.get("screenshot_path"),
             "screenshot_base64": payload.get("screenshot_base64"),
             "screenshot_region": payload.get("screenshot_region"),
+            "screenshot_captured": payload.get("screenshot_captured") is True,
+            "screenshot_status": payload.get("screenshot_status"),
+            "pre_capture_status": payload.get("pre_capture_status"),
+            "pre_capture_error": payload.get("pre_capture_error"),
             "is_valid_chat_window": None,
             "validation_reason": None,
             "vision_error": None,
@@ -1133,6 +1199,10 @@ class GraphMemoryAgent:
             "recognized_user_id": state.get("recognized_user_id"),
             "user_id_change_detected": state.get("user_id_change_detected"),
             "screenshot_region": state.get("screenshot_region"),
+            "screenshot_captured": state.get("screenshot_captured"),
+            "screenshot_status": state.get("screenshot_status"),
+            "pre_capture_status": state.get("pre_capture_status"),
+            "pre_capture_error": state.get("pre_capture_error"),
             "reply": state.get("reply"),
             "working_memory": state.get("working_memory", []),
             "retrieval_query": state.get("retrieval_query"),

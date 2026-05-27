@@ -10,3 +10,4 @@ chat-agent/.env.local
 chat-agent/.npm-cache/
 api-server*.log
 frontend-server*.log
+benchmark_metrics*.json

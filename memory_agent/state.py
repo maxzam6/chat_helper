@@ -26,6 +26,10 @@ class AgentState(TypedDict, total=False):
     screenshot_path: str | None
     screenshot_base64: str | None
     screenshot_region: dict[str, Any] | None
+    screenshot_captured: bool
+    screenshot_status: str | None
+    pre_capture_status: str | None
+    pre_capture_error: str | None
     is_valid_chat_window: bool | None
     validation_reason: str | None
     vision_error: str | None

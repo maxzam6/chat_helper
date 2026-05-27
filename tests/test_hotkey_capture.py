@@ -1,6 +1,7 @@
 import time
 import unittest
 from typing import Any
+from unittest.mock import patch
 
 from memory_agent.hotkey_capture import DISPLAY_HOTKEY, HotkeyCaptureService
 
@@ -71,6 +72,43 @@ class HotkeyCaptureServiceTest(unittest.TestCase):
         self.assertFalse(state["cancel_requested"])
         self.assertEqual(state["latest_result"]["reply"]["content"], "second")
         self.assertEqual(state["latest_result_generation"], 2)
+
+    def test_hotkey_publishes_screenshot_progress_before_agent_result(self):
+        calls: list[dict[str, Any]] = []
+        service = HotkeyCaptureService(lambda: FakeAgent(calls, delay=0.15))
+
+        service.update_context(
+            {
+                "user_input": "她回我哦，我该怎么回？",
+                "screenshot_region": {"left": 1, "top": 1, "width": 20, "height": 20},
+            }
+        )
+
+        with patch("memory_agent.hotkey_capture.capture_region_as_base64", return_value="shot-base64"):
+            service.trigger()
+            progress_state = wait_for(
+                lambda: {
+                    "done": service.status()["latest_progress_generation"] == 1,
+                    "status": service.status(),
+                }
+            )["status"]
+
+            self.assertTrue(progress_state["running"])
+            self.assertEqual(progress_state["latest_progress"]["type"], "screenshot_captured")
+            self.assertEqual(progress_state["latest_progress"]["message"], "截图已完成。")
+            self.assertIsNone(progress_state["latest_result"])
+
+            result_state = wait_for(
+                lambda: {
+                    "done": service.status()["latest_result_generation"] == 1,
+                    "status": service.status(),
+                }
+            )["status"]
+
+        self.assertFalse(result_state["running"])
+        self.assertEqual(calls[0]["screenshot_base64"], "shot-base64")
+        self.assertTrue(calls[0]["screenshot_captured"])
+        self.assertEqual(calls[0]["screenshot_status"], "captured")
 
 
 if __name__ == "__main__":

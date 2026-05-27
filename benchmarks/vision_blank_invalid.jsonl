@@ -1,0 +1,1 @@
+{"id":"vision_invalid_blank_image","payload":{"me_id":"default","current_user_id":"bench_A001","user_input":"她说了什么，我该怎么回？","screenshot_base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="},"expected_intent":"reply_advice","expected_is_valid_chat_window":false}

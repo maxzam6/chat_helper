@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from memory_agent.active_memory_cache import ActiveMemoryCache
 from memory_agent.graph_agent import GraphMemoryAgent
@@ -92,6 +93,11 @@ class FailingAddRetriever(RecordingSemanticRetriever):
         memory_type: str | None,
     ) -> None:
         raise RuntimeError("index unavailable")
+
+
+class FailingVisionLLMClient(MockVisionLLMClient):
+    def parse_chat_screenshot(self, image_base64: str, user_input: str) -> dict[str, Any]:
+        raise RuntimeError("vision unavailable")
 
 
 def make_agent(
@@ -246,6 +252,107 @@ class GraphMemoryAgentLocalTest(unittest.TestCase):
             self.assertTrue(result["working_memory_observations"])
             self.assertTrue(result["reply"])
 
+    def test_general_question_pre_captures_but_does_not_call_vision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            llm = RecordingLLMClient()
+            vision = MockVisionLLMClient()
+            agent, _ = make_agent(store, llm, vision=vision)
+
+            with patch("memory_agent.graph_agent.capture_region_as_base64", return_value="pre-shot"):
+                result = agent.process(
+                    {
+                        "me_id": "default",
+                        "user_input": "LangGraph \u662f\u4ec0\u4e48\uff1f",
+                        "screenshot_region": {"left": 1, "top": 1, "width": 20, "height": 20},
+                    },
+                    return_full_state=True,
+                )
+
+            self.assertEqual(result["intent"], "general_question")
+            self.assertEqual(result["pre_capture_status"], "success")
+            self.assertEqual(result["screenshot_base64"], "pre-shot")
+            self.assertEqual(vision.calls, [])
+            self.assertEqual(llm.tasks, ["intent_classifier", "reply"])
+
+    def test_reply_advice_reuses_pre_captured_base64(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            llm = RecordingLLMClient()
+            vision = MockVisionLLMClient()
+            agent, _ = make_agent(store, llm, vision=vision)
+
+            with patch("memory_agent.graph_agent.capture_region_as_base64", return_value="pre-shot") as pre_capture:
+                with patch(
+                    "tools.chat_screenshot_tool.capture_region_as_base64",
+                    side_effect=AssertionError("should not capture twice"),
+                ):
+                    result = agent.process(
+                        {
+                            "me_id": "default",
+                            "current_user_id": "A001",
+                            "user_input": "\u5979\u56de\u6211\u54e6\uff0c\u6211\u8be5\u600e\u4e48\u56de\uff1f",
+                            "screenshot_region": {"left": 1, "top": 1, "width": 20, "height": 20},
+                        },
+                        return_full_state=True,
+                    )
+
+            self.assertEqual(pre_capture.call_count, 1)
+            self.assertEqual(len(vision.calls), 1)
+            self.assertEqual(vision.calls[0]["image_base64"], "pre-shot")
+            self.assertEqual(result["pre_capture_status"], "success")
+            self.assertTrue(result["screenshot_captured"])
+            self.assertEqual(result["screenshot_status"], "captured")
+            self.assertTrue(result["reply"])
+
+    def test_pre_capture_failure_does_not_block_general_question(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            llm = RecordingLLMClient()
+            vision = MockVisionLLMClient()
+            agent, _ = make_agent(store, llm, vision=vision)
+
+            with patch("memory_agent.graph_agent.capture_region_as_base64", side_effect=RuntimeError("capture boom")):
+                result = agent.process(
+                    {
+                        "me_id": "default",
+                        "user_input": "LangGraph \u662f\u4ec0\u4e48\uff1f",
+                        "screenshot_region": {"left": 1, "top": 1, "width": 20, "height": 20},
+                    },
+                    return_full_state=True,
+                )
+
+            self.assertEqual(result["intent"], "general_question")
+            self.assertEqual(result["status"], "processed")
+            self.assertEqual(result["pre_capture_status"], "failed")
+            self.assertIn("capture boom", result["pre_capture_error"])
+            self.assertTrue(result["reply"])
+            self.assertEqual(vision.calls, [])
+
+    def test_pre_capture_failure_returns_screenshot_failed_for_reply_advice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            llm = RecordingLLMClient()
+            vision = MockVisionLLMClient()
+            agent, _ = make_agent(store, llm, vision=vision)
+
+            with patch("memory_agent.graph_agent.capture_region_as_base64", side_effect=RuntimeError("capture boom")):
+                result = agent.process(
+                    {
+                        "me_id": "default",
+                        "current_user_id": "A001",
+                        "user_input": "\u5979\u56de\u6211\u54e6\uff0c\u6211\u8be5\u600e\u4e48\u56de\uff1f",
+                        "screenshot_region": {"left": 1, "top": 1, "width": 20, "height": 20},
+                    },
+                    return_full_state=True,
+                )
+
+            self.assertEqual(result["status"], "screenshot_failed")
+            self.assertEqual(result["pre_capture_status"], "failed")
+            self.assertIn("capture boom", result["pre_capture_error"])
+            self.assertIn("\u622a\u56fe\u5931\u8d25", result["reply"]["content"])
+            self.assertEqual(vision.calls, [])
+
     def test_invalid_chat_window_does_not_save_session_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = MemoryStore(Path(tmp) / "memory.db")
@@ -310,6 +417,8 @@ class GraphMemoryAgentLocalTest(unittest.TestCase):
             self.assertTrue(result["working_memory_observations"])
             self.assertTrue(result["reply"])
             self.assertTrue(result["saved_memory_ids"])
+            self.assertTrue(result["screenshot_captured"])
+            self.assertEqual(result["screenshot_status"], "captured")
 
     def test_screenshot_region_without_vision_client_returns_clear_error(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -322,7 +431,13 @@ class GraphMemoryAgentLocalTest(unittest.TestCase):
                     "me_id": "default",
                     "current_user_id": "A001",
                     "user_input": "\u5979\u56de\u6211\u54e6\uff0c\u6211\u8be5\u600e\u4e48\u56de\uff1f",
-                    "screenshot_region": {"left": 420, "top": 80, "width": 900, "height": 900},
+                    "screenshot_region": {
+                        "left": 420,
+                        "top": 80,
+                        "width": 900,
+                        "height": 900,
+                        "mock_image_base64": "mock-image",
+                    },
                 },
                 return_full_state=True,
             )
@@ -330,6 +445,34 @@ class GraphMemoryAgentLocalTest(unittest.TestCase):
             self.assertEqual(result["status"], "vision_parse_failed")
             self.assertEqual(result["vision_error"], "vision_llm_client_required")
             self.assertFalse(result["session_state_saved"])
+            self.assertTrue(result["screenshot_captured"])
+
+    def test_vision_failure_after_capture_reports_screenshot_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            llm = RecordingLLMClient()
+            agent, _ = make_agent(store, llm, vision=FailingVisionLLMClient())
+
+            result = agent.process(
+                {
+                    "me_id": "default",
+                    "current_user_id": "A001",
+                    "user_input": "\u5979\u56de\u6211\u54e6\uff0c\u6211\u8be5\u600e\u4e48\u56de\uff1f",
+                    "screenshot_region": {
+                        "left": 420,
+                        "top": 80,
+                        "width": 900,
+                        "height": 900,
+                        "mock_image_base64": "mock-image",
+                    },
+                },
+                return_full_state=True,
+            )
+
+            self.assertEqual(result["status"], "vision_parse_failed")
+            self.assertTrue(result["screenshot_captured"])
+            self.assertEqual(result["screenshot_status"], "captured")
+            self.assertIn("vision_parse_failed", result["vision_error"])
 
     def test_recognized_user_id_change_stops_before_memory_write(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -367,6 +510,41 @@ class GraphMemoryAgentLocalTest(unittest.TestCase):
             self.assertEqual(result["recognized_user_id"], "A002")
             self.assertFalse(result["session_state_saved"])
             self.assertEqual(store.get_user_memory("A001"), [])
+
+    def test_recognized_user_id_without_current_user_asks_for_switch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            llm = RecordingLLMClient()
+            vision = MockVisionLLMClient(
+                {
+                    "is_valid_chat_window": True,
+                    "validation_reason": "valid",
+                    "recognized_user_id": "wechat_user_01",
+                    "chat_context": make_chat_context(),
+                    "working_memory_observations": [],
+                }
+            )
+            agent, _ = make_agent(store, llm, vision=vision)
+
+            result = agent.process(
+                {
+                    "me_id": "default",
+                    "user_input": "\u5979\u56de\u6211\u54e6\uff0c\u6211\u8be5\u600e\u4e48\u56de\uff1f",
+                    "screenshot_region": {
+                        "left": 420,
+                        "top": 80,
+                        "width": 900,
+                        "height": 900,
+                        "mock_image_base64": "mock-image",
+                    },
+                },
+                return_full_state=True,
+            )
+
+            self.assertEqual(result["status"], "user_id_change_detected")
+            self.assertEqual(result["recognized_user_id"], "wechat_user_01")
+            self.assertTrue(result["screenshot_captured"])
+            self.assertIsNone(result.get("current_user_id"))
 
     def test_missing_current_user_and_no_recognized_user_stays_missing_user_id(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -414,7 +592,13 @@ class GraphMemoryAgentLocalTest(unittest.TestCase):
                     "current_user_id": "A001",
                     "user_input": "\u5979\u56de\u6211\u54e6\uff0c\u6211\u8be5\u600e\u4e48\u56de\uff1f",
                     "chat_context": make_chat_context(),
-                    "screenshot_region": {"left": 420, "top": 80, "width": 900, "height": 900},
+                    "screenshot_region": {
+                        "left": 420,
+                        "top": 80,
+                        "width": 900,
+                        "height": 900,
+                        "mock_image_base64": "mock-image",
+                    },
                 }
             )
 
@@ -423,6 +607,8 @@ class GraphMemoryAgentLocalTest(unittest.TestCase):
             self.assertIn("vision_error", result)
             self.assertIn("recognized_user_id", result)
             self.assertIn("user_id_change_detected", result)
+            self.assertIn("screenshot_captured", result)
+            self.assertIn("screenshot_status", result)
             self.assertEqual(result["screenshot_region"]["left"], 420)
 
     def test_profile_update_skips_ocr_and_updates_memory(self):

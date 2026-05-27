@@ -13,9 +13,7 @@ function App() {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [isLoading, setIsLoading] = useState(false)
-  const [currentUser, setCurrentUser] = useState(
-    () => localStorage.getItem('chat_current_user') || DEFAULT_USER,
-  )
+  const [currentUser, setCurrentUser] = useState(DEFAULT_USER)
   const [showUserDropdown, setShowUserDropdown] = useState(false)
   const [newUserName, setNewUserName] = useState('')
   const [userSuggestions, setUserSuggestions] = useState([])
@@ -27,6 +25,7 @@ function App() {
   const fileInputRef = useRef(null)
   const pollTimerRef = useRef(null)
   const lastResultGenerationRef = useRef(0)
+  const lastProgressGenerationRef = useRef(0)
   const hotkeyLabel = hotkeyStatus?.hotkey || 'Ctrl + Shift + Y'
 
   const stopPolling = useCallback(() => {
@@ -48,141 +47,18 @@ function App() {
     }
   }, [])
 
-  useEffect(() => {
-    const timer = window.setTimeout(() => {
-      refreshCaptureStatus()
-    }, 0)
-    return () => {
-      window.clearTimeout(timer)
-      stopPolling()
-    }
-  }, [refreshCaptureStatus, stopPolling])
-
-  useEffect(() => {
-    if (currentUser) {
-      localStorage.setItem('chat_current_user', currentUser)
-    } else {
-      localStorage.removeItem('chat_current_user')
-    }
-  }, [currentUser])
-
-  const startPolling = () => {
-    stopPolling()
-    pollTimerRef.current = window.setInterval(async () => {
-      const status = await refreshCaptureStatus()
-      if (!status) return
-      if (status.running) {
-        setIsLoading(true)
-        return
-      }
-      if (status.latest_error && status.latest_error !== 'cancel_requested') {
-        setIsLoading(false)
-        appendAssistantMessage(`请求失败：${status.latest_error}`, true)
-        stopPolling()
-        return
-      }
-      const resultGeneration = status.latest_result_generation || 0
-      if (status.latest_result && resultGeneration > lastResultGenerationRef.current) {
-        lastResultGenerationRef.current = resultGeneration
-        setIsLoading(false)
-        handleAgentResult(status.latest_result)
-        stopPolling()
-      }
-    }, 900)
-  }
-
-  const suggestUsers = async (query) => {
-    if (!query.trim()) {
-      setUserSuggestions([])
-      return []
-    }
-    try {
-      const response = await fetch(`/api/users/suggest?query=${encodeURIComponent(query)}&limit=5`)
-      if (!response.ok) return []
-      const data = await response.json()
-      const suggestions = data.suggestions || []
-      setUserSuggestions(suggestions)
-      return suggestions
-    } catch {
-      setUserSuggestions([])
-      return []
-    }
-  }
-
-  const buildPayload = (content) => {
-    const payload = {
-      me_id: 'default',
-      user_input: content,
-      screenshot_region: FIXED_SCREENSHOT_REGION,
-    }
-    if (currentUser.trim()) {
-      payload.current_user_id = currentUser.trim()
-    }
-    if (screenshotBase64) {
-      payload.screenshot_base64 = screenshotBase64
-    }
-    return payload
-  }
-
-  const prepareHotkeyCapture = async () => {
-    const content = input.trim()
-    const payload = buildPayload(content)
-    const response = await fetch('/api/capture/context', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    })
-    const data = await response.json()
-    if (!response.ok) {
-      throw new Error(data.detail || 'Capture context update failed')
-    }
-    setHotkeyStatus(data)
-    if (typeof data.latest_result_generation === 'number') {
-      lastResultGenerationRef.current = Math.max(
-        lastResultGenerationRef.current,
-        data.latest_result_generation,
-      )
-    }
-    setPrepared(true)
-    startPolling()
-  }
-
-  const sendMessage = async () => {
-    const content = input.trim()
-
+  const appendAssistantMessage = useCallback((content, error = false) => {
     setMessages((prev) => [
       ...prev,
       {
-        role: 'user',
-        content: content || `[等待快捷键截图分析${screenshotName ? `：${screenshotName}` : ''}]`,
-        user: currentUser || '未选择',
+        role: 'assistant',
+        content,
+        error,
       },
     ])
-    setIsLoading(false)
+  }, [])
 
-    try {
-      await prepareHotkeyCapture()
-      appendAssistantMessage(
-        `已准备好。请切回微信/QQ窗口，按 ${hotkeyLabel} 开始分析。`,
-      )
-    } catch (error) {
-      appendAssistantMessage(`请求失败：${error.message}`, true)
-    }
-  }
-
-  const stopGeneration = async () => {
-    stopPolling()
-    setIsLoading(false)
-    setPrepared(false)
-    try {
-      await fetch('/api/capture/cancel', { method: 'POST' })
-    } catch {
-      // Best-effort cancellation; an in-flight model request may finish later.
-    }
-    appendAssistantMessage('已停止等待本轮生成。')
-  }
-
-  const handleAgentResult = (data) => {
+  const handleAgentResult = useCallback((data) => {
     setLastResult(data)
     if (data.user_id_suggestions?.length) {
       setUserSuggestions(data.user_id_suggestions)
@@ -212,17 +88,166 @@ function App() {
     appendAssistantMessage(data.reply?.content || '这轮没有生成可发送的回复。')
     setScreenshotBase64('')
     setScreenshotName('')
+  }, [appendAssistantMessage])
+
+  const handleCaptureProgress = useCallback((progress) => {
+    if (!progress) return
+    if (progress.type === 'screenshot_captured') {
+      appendAssistantMessage(progress.message || '截图已完成。')
+      setIsLoading(true)
+      return
+    }
+    if (progress.type === 'screenshot_failed') {
+      appendAssistantMessage(progress.message || '截图失败。', true)
+    }
+  }, [appendAssistantMessage])
+
+  const startPolling = useCallback(() => {
+    stopPolling()
+    pollTimerRef.current = window.setInterval(async () => {
+      const status = await refreshCaptureStatus()
+      if (!status) return
+      const progressGeneration = status.latest_progress_generation || 0
+      if (status.latest_progress && progressGeneration > lastProgressGenerationRef.current) {
+        lastProgressGenerationRef.current = progressGeneration
+        handleCaptureProgress(status.latest_progress)
+      }
+      if (status.running) {
+        setIsLoading(true)
+        return
+      }
+      if (status.latest_error && status.latest_error !== 'cancel_requested') {
+        setIsLoading(false)
+        appendAssistantMessage(`请求失败：${status.latest_error}`, true)
+        stopPolling()
+        return
+      }
+      const resultGeneration = status.latest_result_generation || 0
+      if (status.latest_result && resultGeneration > lastResultGenerationRef.current) {
+        lastResultGenerationRef.current = resultGeneration
+        setIsLoading(false)
+        handleAgentResult(status.latest_result)
+        stopPolling()
+      }
+    }, 900)
+  }, [appendAssistantMessage, handleAgentResult, handleCaptureProgress, refreshCaptureStatus, stopPolling])
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      refreshCaptureStatus()
+      startPolling()
+    }, 0)
+    return () => {
+      window.clearTimeout(timer)
+      stopPolling()
+    }
+  }, [refreshCaptureStatus, startPolling, stopPolling])
+
+  const suggestUsers = async (query) => {
+    if (!query.trim()) {
+      setUserSuggestions([])
+      return []
+    }
+    try {
+      const response = await fetch(`/api/users/suggest?query=${encodeURIComponent(query)}&limit=5`)
+      if (!response.ok) return []
+      const data = await response.json()
+      const suggestions = data.suggestions || []
+      setUserSuggestions(suggestions)
+      return suggestions
+    } catch {
+      setUserSuggestions([])
+      return []
+    }
   }
 
-  const appendAssistantMessage = (content, error = false) => {
+  const buildPayload = useCallback((content) => {
+    const payload = {
+      me_id: 'default',
+      user_input: content,
+      screenshot_region: FIXED_SCREENSHOT_REGION,
+    }
+    if (currentUser.trim()) {
+      payload.current_user_id = currentUser.trim()
+    }
+    if (screenshotBase64) {
+      payload.screenshot_base64 = screenshotBase64
+    }
+    return payload
+  }, [currentUser, screenshotBase64])
+
+  const syncHotkeyContext = useCallback(async () => {
+    const content = input.trim()
+    const payload = buildPayload(content)
+    const response = await fetch('/api/capture/context', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    const data = await response.json()
+    if (!response.ok) {
+      throw new Error(data.detail || 'Capture context update failed')
+    }
+    setHotkeyStatus(data)
+    if (typeof data.latest_result_generation === 'number') {
+      lastResultGenerationRef.current = Math.max(
+        lastResultGenerationRef.current,
+        data.latest_result_generation,
+      )
+    }
+    if (typeof data.latest_progress_generation === 'number') {
+      lastProgressGenerationRef.current = Math.max(
+        lastProgressGenerationRef.current,
+        data.latest_progress_generation,
+      )
+    }
+    setPrepared(true)
+    startPolling()
+    return data
+  }, [buildPayload, input, startPolling])
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      syncHotkeyContext().catch((error) => {
+        appendAssistantMessage(`快捷键上下文同步失败：${error.message}`, true)
+      })
+    }, 350)
+    return () => window.clearTimeout(timer)
+  }, [appendAssistantMessage, syncHotkeyContext])
+
+  const sendMessage = async () => {
+    const content = input.trim()
+
     setMessages((prev) => [
       ...prev,
       {
-        role: 'assistant',
-        content,
-        error,
+        role: 'user',
+        content: content || `[等待快捷键截图分析${screenshotName ? `：${screenshotName}` : ''}]`,
+        user: currentUser || '未选择',
       },
     ])
+    setIsLoading(false)
+
+    try {
+      await syncHotkeyContext()
+      appendAssistantMessage(
+        `快捷键内容已更新。请切回微信/QQ窗口，按 ${hotkeyLabel} 开始分析。`,
+      )
+    } catch (error) {
+      appendAssistantMessage(`请求失败：${error.message}`, true)
+    }
+  }
+
+  const stopGeneration = async () => {
+    stopPolling()
+    setIsLoading(false)
+    setPrepared(false)
+    try {
+      await fetch('/api/capture/cancel', { method: 'POST' })
+    } catch {
+      // Best-effort cancellation; an in-flight model request may finish later.
+    }
+    appendAssistantMessage('已停止等待本轮生成。')
   }
 
   const confirmSwitch = async () => {
@@ -375,7 +400,6 @@ function App() {
               value={input}
               onChange={(event) => {
                 setInput(event.target.value)
-                setPrepared(false)
               }}
               onKeyDown={(event) => {
                 if (event.key === 'Enter' && !event.shiftKey) {
@@ -405,11 +429,11 @@ function App() {
               </button>
             ) : (
               <button className="send-button" onClick={sendMessage}>
-                准备快捷键分析
+                {hotkeyLabel}
               </button>
             )}
           </div>
-          <div className="input-tip">准备后切回微信/QQ，按 {hotkeyLabel}</div>
+          <div className="input-tip">已自动同步内容；切回微信/QQ 后直接按 {hotkeyLabel}</div>
         </footer>
 
         {lastResult && (
